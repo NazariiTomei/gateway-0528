@@ -127,9 +127,10 @@ By coordinating distributed bandwidth and measuring performance through Proof-of
 
 ## Run a Node
 
-This repository contains the code for running orchestrators and validators on the BEAM network.
+This repository contains the code for running orchestrators, workers, and validators on the BEAM network.
 
 - [Orchestrator Guide](docs/orchestrator.md) — Run a miner node that coordinates bandwidth work
+- [Worker Guide](docs/worker.md) — Run a worker node that executes transfer tasks
 - [Validator Guide](docs/validator.md) — Run a validator that verifies proofs and sets weights
 
 ### Network Information

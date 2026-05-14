@@ -52,7 +52,7 @@ Typical environment:
 export CORE_SERVER_URL=https://beamcore.b1m.ai
 export WORKER_GATEWAY_URL=https://public-worker-gateway.b1m.ai
 export CONNECTION_MODE=auto               # or websocket (see worker.py)
-python worker.py --subtensor.network test
+python worker.py --subtensor.network finney
 ```
 
 ## How It Works
