@@ -67,9 +67,9 @@ Machine-to-machine communication is rapidly increasing:
 
 These workflows involve terabytes or petabytes moving across regions and independent systems. BEAM provides a decentralized coordination layer for this data movement.
 
-## BeamCore V2 (coordination stack)
+## BeamCore (coordination stack)
 
-This repository is **off-chain node software** (orchestrator, worker, validator) that connects to **BeamCore V2**.
+This repository is **off-chain node software** (orchestrator, worker, validator) that connects to **BeamCore**.
 
 ### Services (typical ports)
 
@@ -113,7 +113,7 @@ Clients / Validators                Orchestrators
 
 > **Note:** `WORKER_GATEWAY_URL` / worker env must target the **worker-gateway** base URL. BeamCore HTTP (`CORE_SERVER_URL`) is orthogonal (registration, REST, evidence POSTs).
 
-For operator-level connection maps and env naming, use the BeamCore V2 operator documentation published for your target network.
+For operator-level connection maps and env naming, use the BeamCore operator documentation published for your target network.
 
 ## The Vision
 
@@ -141,7 +141,7 @@ This repository contains the code for running orchestrators, workers, and valida
 
 ## Links
 
-- BeamCore V2 — API, control plane, gateways, PRISM pipeline
+- BeamCore — API, control plane, gateways, PRISM pipeline
 - [Bittensor](https://bittensor.com)
 
 ## License

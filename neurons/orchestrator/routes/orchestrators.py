@@ -1,7 +1,7 @@
 """
 Orchestrator Management API Routes
 
-Endpoints for orchestrator registration, datastream creation, and SLA management.
+Endpoints for orchestrator registration and datastream creation.
 These endpoints allow orchestrators to register with the subnet and manage their datastreams.
 
 UID Allocation:
@@ -101,23 +101,7 @@ class OrchestratorInfo(BaseModel):
     grace_period_ends: Optional[datetime] = None
     worker_count: int = 0
     datastream_count: int = 0
-    sla_score: Optional[float] = None
 
-
-class OrchestratorSLAResponse(BaseModel):
-    """SLA metrics for an orchestrator."""
-
-    uid: int
-    uptime_percent: float
-    bandwidth_mbps: float
-    latency_p95_ms: float
-    acceptance_rate_percent: float
-    success_rate_percent: float
-    combined_multiplier: float
-    effective_multiplier: float
-    penalty_redirect_percent: float
-    in_grace_period: bool
-    violations: List[str] = []
 
 
 class WorkerAffiliationRequest(BaseModel):
@@ -163,8 +147,6 @@ async def register_orchestrator(
     - UID must be between 2-256 (valid orchestrator range)
     - Valid Bittensor hotkey
 
-    New orchestrators enter a 24-hour grace period during which
-    SLA penalties are not applied.
     """
     try:
         # Check if manager is available
@@ -278,11 +260,6 @@ async def update_orchestrator(
         grace_period_ends=orch.grace_period_ends,
         worker_count=len(orch.worker_hotkeys),
         datastream_count=len([d for d in orch.datastreams.values() if d.is_active]),
-        sla_score=(
-            orch.sla_state.score.effective_multiplier
-            if orch.sla_state and orch.sla_state.score
-            else None
-        ),
     )
 
 
@@ -316,11 +293,6 @@ async def get_orchestrator_info(
         grace_period_ends=orch.grace_period_ends,
         worker_count=len(orch.worker_hotkeys),
         datastream_count=len([d for d in orch.datastreams.values() if d.is_active]),
-        sla_score=(
-            orch.sla_state.score.effective_multiplier
-            if orch.sla_state and orch.sla_state.score
-            else None
-        ),
     )
 
 
@@ -363,60 +335,10 @@ async def list_orchestrators(
             grace_period_ends=o.grace_period_ends,
             worker_count=len(o.worker_hotkeys),
             datastream_count=len([d for d in o.datastreams.values() if d.is_active]),
-            sla_score=(
-                o.sla_state.score.effective_multiplier
-                if o.sla_state and o.sla_state.score
-                else None
-            ),
         )
         for o in orchestrators
     ]
 
-
-@router.get("/{uid}/sla", response_model=OrchestratorSLAResponse)
-async def get_orchestrator_sla(
-    uid: int,
-    orchestrator: Orchestrator = Depends(get_orchestrator_instance),
-):
-    """Get SLA metrics for an orchestrator."""
-    if not hasattr(orchestrator, "orch_manager"):
-        raise HTTPException(status_code=503, detail="Orchestrator manager not initialized")
-
-    orch = orchestrator.orch_manager.get_orchestrator(uid)
-    if not orch:
-        raise HTTPException(status_code=404, detail=f"Orchestrator UID {uid} not found")
-
-    if not orch.sla_state or not orch.sla_state.metrics:
-        return OrchestratorSLAResponse(
-            uid=uid,
-            uptime_percent=0.0,
-            bandwidth_mbps=0.0,
-            latency_p95_ms=0.0,
-            acceptance_rate_percent=0.0,
-            success_rate_percent=0.0,
-            combined_multiplier=1.0,
-            effective_multiplier=1.0,
-            penalty_redirect_percent=0.0,
-            in_grace_period=orch.in_grace_period,
-            violations=[],
-        )
-
-    metrics = orch.sla_state.metrics
-    score = orch.sla_state.score
-
-    return OrchestratorSLAResponse(
-        uid=uid,
-        uptime_percent=metrics.uptime_percent,
-        bandwidth_mbps=metrics.bandwidth_mbps,
-        latency_p95_ms=metrics.latency_p95_ms,
-        acceptance_rate_percent=metrics.acceptance_rate_percent,
-        success_rate_percent=metrics.success_rate_percent,
-        combined_multiplier=score.combined_multiplier if score else 1.0,
-        effective_multiplier=score.effective_multiplier if score else 1.0,
-        penalty_redirect_percent=score.penalty_redirect_percent if score else 0.0,
-        in_grace_period=score.in_grace_period if score else orch.in_grace_period,
-        violations=[v.value for v in score.violations] if score else [],
-    )
 
 
 # =============================================================================
@@ -671,13 +593,6 @@ async def get_orchestrator_stats(
         len([d for d in o.datastreams.values() if d.is_active]) for o in orchestrators
     )
 
-    # Average SLA score (excluding grace period)
-    sla_scores = [
-        o.sla_state.score.effective_multiplier
-        for o in non_subnet
-        if o.sla_state and o.sla_state.score and not o.in_grace_period
-    ]
-    avg_sla_score = sum(sla_scores) / len(sla_scores) if sla_scores else 1.0
 
     return {
         "total_orchestrators": len(orchestrators),
@@ -685,7 +600,6 @@ async def get_orchestrator_stats(
         "orchestrators_by_status": status_counts,
         "total_workers": total_workers,
         "total_datastreams": total_datastreams,
-        "avg_sla_score": round(avg_sla_score, 4),
         "subnet_orchestrator": (
             {
                 "uid": 1,

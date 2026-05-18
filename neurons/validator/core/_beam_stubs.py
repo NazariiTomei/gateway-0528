@@ -6,10 +6,8 @@ validation logic is handled by BeamCore.
 """
 
 import hashlib
-import os
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import IntEnum
 from typing import Any, Dict, List, Optional
 
 # ============================================================================
@@ -59,12 +57,6 @@ BANDWIDTH_EMA_ALPHA: float = 0.3
 # ============================================================================
 
 
-class SLALevel(IntEnum):
-    BEST_EFFORT = 0
-    STANDARD = 1
-    PREMIUM = 2
-
-
 @dataclass
 class Task:
     """Bandwidth task."""
@@ -74,7 +66,6 @@ class Task:
     chunk_hash: bytes = b""
     chunk_size: int = 0
     deadline: int = 0
-    sla_level: SLALevel = SLALevel.BEST_EFFORT
     canary: bytes = b""
     canary_offset: int = 0
     path: List[str] = field(default_factory=list)
@@ -158,7 +149,6 @@ try:
         canary_offset: int = PydanticField(default=0, description="Canary offset")
         path: List[str] = PydanticField(default_factory=list, description="Relay path")
         expected_hops: int = PydanticField(default=1, description="Expected hops")
-        sla_level: int = PydanticField(default=0, description="SLA level")
         accepted: bool = PydanticField(default=False, description="Challenge accepted")
         worker_assigned: Optional[str] = PydanticField(default=None, description="Assigned worker")
 
@@ -236,7 +226,6 @@ except ImportError:
         canary_offset: int = 0
         path: List[str] = field(default_factory=list)
         expected_hops: int = 1
-        sla_level: int = 0
         accepted: bool = False
         worker_assigned: Optional[str] = None
 
@@ -290,169 +279,6 @@ except ImportError:
 
 
 # ============================================================================
-# Scoring helpers
-# ============================================================================
-
-# UID constants (can be overridden by env vars)
-SUBNET_ORCHESTRATOR_UID = int(os.getenv("SUBNET_ORCHESTRATOR_UID", "1"))
-PUBLIC_ORCHESTRATOR_UID_START = int(os.getenv("PUBLIC_ORCHESTRATOR_UID_START", "2"))
-PUBLIC_ORCHESTRATOR_UID_END = int(os.getenv("PUBLIC_ORCHESTRATOR_UID_END", "256"))
-NEW_ORCHESTRATOR_GRACE_PERIOD_HOURS = 24
-
-
-@dataclass
-class SLAMetrics:
-    """SLA metrics for an entity."""
-
-    uptime: float = 1.0
-    uptime_percent: float = 100.0
-    success_rate: float = 1.0
-    success_rate_percent: float = 100.0
-    acceptance_rate_percent: float = 100.0
-    avg_latency_ms: float = 0.0
-    latency_p95_ms: float = 0.0
-    jitter_ms: float = 0.0
-    bandwidth_mbps: float = 0.0
-    packet_loss_percent: float = 0.0
-    sample_count: int = 0
-    measurement_start: Optional[datetime] = None
-    measurement_end: Optional[datetime] = None
-
-    @classmethod
-    def from_latency_samples(
-        cls,
-        latency_samples: Optional[List[float]] = None,
-        uptime_percent: float = 100.0,
-        bandwidth_mbps: float = 0.0,
-        acceptance_rate_percent: float = 100.0,
-        success_rate_percent: float = 100.0,
-        measurement_start: Optional[datetime] = None,
-        measurement_end: Optional[datetime] = None,
-    ) -> "SLAMetrics":
-        """Create SLAMetrics from latency samples.
-
-        Args:
-            latency_samples: List of latency measurements in milliseconds
-            uptime_percent: Uptime percentage (0-100)
-            bandwidth_mbps: Measured bandwidth in Mbps
-            acceptance_rate_percent: Task acceptance rate (0-100)
-            success_rate_percent: Task success rate (0-100)
-            measurement_start: Start of measurement window
-            measurement_end: End of measurement window
-
-        Returns:
-            SLAMetrics instance with computed values
-        """
-        samples = latency_samples or []
-        avg_latency = sum(samples) / len(samples) if samples else 0.0
-        # P95 approximation: use 95th percentile if enough samples, else use avg
-        p95_latency = (
-            sorted(samples)[int(len(samples) * 0.95)] if len(samples) >= 20 else avg_latency
-        )
-        return cls(
-            uptime=uptime_percent / 100.0,
-            uptime_percent=uptime_percent,
-            success_rate=success_rate_percent / 100.0,
-            success_rate_percent=success_rate_percent,
-            acceptance_rate_percent=acceptance_rate_percent,
-            avg_latency_ms=avg_latency,
-            latency_p95_ms=p95_latency,
-            bandwidth_mbps=bandwidth_mbps,
-            sample_count=len(samples),
-            measurement_start=measurement_start,
-            measurement_end=measurement_end,
-        )
-
-
-@dataclass
-class SLAMultipliers:
-    """SLA component multipliers."""
-
-    uptime: float = 1.0
-    bandwidth: float = 1.0
-    latency: float = 1.0
-    jitter: float = 1.0
-    acceptance: float = 1.0
-    success: float = 1.0
-
-
-@dataclass
-class SLAScore:
-    """Calculated SLA score."""
-
-    raw_score: float = 1.0
-    penalty_multiplier: float = 1.0
-    final_score: float = 1.0
-    effective_multiplier: float = 1.0
-    combined_multiplier: float = 1.0
-    penalty_redirect_percent: float = 0.0
-    in_grace_period: bool = False
-    violations: List[str] = field(default_factory=list)
-    multipliers: SLAMultipliers = field(default_factory=SLAMultipliers)
-
-
-@dataclass
-class OrchestratorSLAState:
-    """SLA state for an orchestrator."""
-
-    uid: int = 0
-    hotkey: str = ""
-    metrics: Optional[SLAMetrics] = None
-    score: Optional[SLAScore] = None
-    in_grace_period: bool = False
-    is_subnet_owned: bool = False
-    registered_at: Optional[datetime] = None
-    grace_period_ends: Optional[datetime] = None
-
-
-@dataclass
-class WorkerSLAState:
-    """SLA state for a worker."""
-
-    worker_id: str = ""
-    hotkey: str = ""
-    metrics: SLAMetrics = field(default_factory=SLAMetrics)
-    score: SLAScore = field(default_factory=SLAScore)
-
-
-class SLAScorer:
-    """SLA scorer (stub - scoring done by BeamCore)."""
-
-    def __init__(self, **kwargs):
-        pass
-
-    def calculate_score(self, metrics: SLAMetrics) -> SLAScore:
-        return SLAScore()
-
-    def get_penalty_multiplier(self, violations: List[str]) -> float:
-        return 1.0
-
-    def score_orchestrator(self, sla_state: "OrchestratorSLAState") -> SLAScore:
-        """Score an orchestrator based on SLA state."""
-        return SLAScore(
-            raw_score=1.0,
-            penalty_multiplier=1.0,
-            final_score=1.0,
-            effective_multiplier=1.0,
-            combined_multiplier=1.0,
-        )
-
-    def score_worker(self, sla_state: "WorkerSLAState") -> SLAScore:
-        """Score a worker based on SLA state."""
-        return SLAScore()
-
-
-class SLARewardCalculator:
-    """SLA reward calculator (stub - calculations done by BeamCore)."""
-
-    def __init__(self, sla_scorer=None, **kwargs):
-        self.sla_scorer = sla_scorer
-
-    def calculate_rewards(self, scores: Dict[int, float], total_emission: int) -> Dict[int, int]:
-        return {}
-
-
-# ============================================================================
 # Orchestrator helpers
 # ============================================================================
 
@@ -467,8 +293,6 @@ class Orchestrator:
     status: str = "active"
     worker_count: int = 0
     is_subnet_owned: bool = False
-    sla_state: Optional["OrchestratorSLAState"] = None
-
 
 class OrchestratorManager:
     """Orchestrator manager (stub - management done by BeamCore)."""
@@ -543,7 +367,7 @@ class ReassignmentManager:
         self.worker_registry = worker_registry
         self.pending_reassignments: List[Any] = []
 
-    def check_and_queue_sla_reassignments(self) -> List[Any]:
+    def check_and_queue_reassignments(self) -> List[Any]:
         return []
 
     def process_pending_reassignments(self) -> List[Any]:

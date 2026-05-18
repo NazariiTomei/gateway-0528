@@ -40,9 +40,9 @@ class TaskScheduler:
         dest_region: str = "",
         execution_context: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """No-op under BeamCore v2.
+        """No-op under BeamCore.
 
-        v2 creates tasks server-side from the orchestrator's WS
+        BeamCore creates tasks server-side from the orchestrator's WS
         ``chunk_assignments`` message (see orchestrator-ws.ts and
         queueTransferTaskAssignments). Orchestrators no longer write task
         records via HTTP. Kept as a no-op so existing call sites remain

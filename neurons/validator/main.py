@@ -188,15 +188,9 @@ async def get_network_analytics():
 
     if hasattr(validator, "orchestrator_manager"):
         for orch in validator.orchestrator_manager.get_all_orchestrators():
-            is_healthy = True
-            sla_multiplier = 1.0
-            bandwidth = 0.0
-
-            if orch.sla_state and orch.sla_state.score:
-                sla_multiplier = orch.sla_state.score.effective_multiplier
-                is_healthy = sla_multiplier > 0.5
-                if orch.sla_state.metrics:
-                    bandwidth = orch.sla_state.metrics.bandwidth_mbps
+            score = float(getattr(orch, "last_score", 0.0) or 0.0)
+            is_healthy = score > 0.05
+            bandwidth = float(getattr(orch, "bandwidth_mbps", 0.0) or 0.0)
 
             if is_healthy:
                 healthy_count += 1
@@ -210,7 +204,7 @@ async def get_network_analytics():
                         orch.hotkey[:8] + "..." + orch.hotkey[-4:] if orch.hotkey else "unknown"
                     ),
                     "is_healthy": is_healthy,
-                    "sla_multiplier": round(sla_multiplier, 4),
+                    "score": round(score, 4),
                     "bandwidth_mbps": round(bandwidth, 2),
                     "worker_count": getattr(orch, "worker_count", 0),
                     "is_subnet_owned": getattr(orch, "is_subnet_owned", False),
@@ -250,14 +244,14 @@ async def get_network_analytics():
         },
         "anti_gaming": sybil_stats,
         "orchestrator_list": sorted(
-            orchestrators, key=lambda item: item["sla_multiplier"], reverse=True
+            orchestrators, key=lambda item: item["score"], reverse=True
         ),
     }
 
 
 @app.get("/analytics/orchestrators")
 async def get_orchestrator_analytics():
-    """Get detailed orchestrator analytics with SLA breakdown."""
+    """Get detailed orchestrator analytics."""
     if not validator:
         raise HTTPException(status_code=503, detail="Validator not initialized")
 
@@ -271,42 +265,7 @@ async def get_orchestrator_analytics():
                 "worker_count": getattr(orch, "worker_count", 0),
             }
 
-            if orch.sla_state and orch.sla_state.score:
-                score = orch.sla_state.score
-                metrics = orch.sla_state.metrics or {}
-                orch_data["sla"] = {
-                    "effective_multiplier": round(score.effective_multiplier, 4),
-                    "combined_multiplier": round(score.combined_multiplier, 4),
-                    "penalty_percent": round(score.penalty_redirect_percent, 2),
-                    "in_grace_period": score.in_grace_period,
-                    "violations": (
-                        [violation.value for violation in score.violations]
-                        if score.violations
-                        else []
-                    ),
-                    "multipliers": {
-                        "uptime": round(score.multipliers.uptime, 4),
-                        "bandwidth": round(score.multipliers.bandwidth, 4),
-                        "latency": round(score.multipliers.latency, 4),
-                        "jitter": round(score.multipliers.jitter, 4),
-                        "acceptance": round(score.multipliers.acceptance, 4),
-                        "success": round(score.multipliers.success, 4),
-                    },
-                }
-
-                if hasattr(metrics, "uptime_percent"):
-                    orch_data["metrics"] = {
-                        "uptime_percent": round(metrics.uptime_percent, 2),
-                        "bandwidth_mbps": round(metrics.bandwidth_mbps, 2),
-                        "latency_p95_ms": round(metrics.latency_p95_ms, 2),
-                        "jitter_ms": round(getattr(metrics, "jitter_ms", 0.0), 2),
-                        "acceptance_rate": round(metrics.acceptance_rate_percent, 2),
-                        "success_rate": round(metrics.success_rate_percent, 2),
-                        "sample_count": metrics.sample_count,
-                    }
-            else:
-                orch_data["sla"] = None
-                orch_data["metrics"] = None
+            orch_data["score"] = round(float(getattr(orch, "last_score", 0.0) or 0.0), 4)
 
             if hasattr(validator, "_get_sybil_penalty_multipliers"):
                 sybil_mults = validator._get_sybil_penalty_multipliers()
@@ -318,9 +277,7 @@ async def get_orchestrator_analytics():
         "count": len(orchestrators),
         "orchestrators": sorted(
             orchestrators,
-            key=lambda item: (
-                item.get("sla", {}).get("effective_multiplier", 0) if item.get("sla") else 0
-            ),
+            key=lambda item: item.get("score", 0),
             reverse=True,
         ),
     }
@@ -338,15 +295,8 @@ async def get_leaderboard():
             if orch.is_subnet_owned:
                 continue
 
-            effective_mult = 1.0
-            bandwidth = 0.0
-            latency = 0.0
-
-            if orch.sla_state and orch.sla_state.score:
-                effective_mult = orch.sla_state.score.effective_multiplier
-                if orch.sla_state.metrics:
-                    bandwidth = orch.sla_state.metrics.bandwidth_mbps
-                    latency = orch.sla_state.metrics.latency_p95_ms
+            score = float(getattr(orch, "last_score", 0.0) or 0.0)
+            bandwidth = float(getattr(orch, "bandwidth_mbps", 0.0) or 0.0)
 
             leaderboard.append(
                 {
@@ -355,10 +305,8 @@ async def get_leaderboard():
                     "hotkey_short": (
                         orch.hotkey[:8] + "..." + orch.hotkey[-4:] if orch.hotkey else "unknown"
                     ),
-                    "score": round(effective_mult * 100, 2),
-                    "sla_multiplier": round(effective_mult, 4),
+                    "score": round(score * 100, 2),
                     "bandwidth_mbps": round(bandwidth, 2),
-                    "latency_p95_ms": round(latency, 2),
                     "worker_count": getattr(orch, "worker_count", 0),
                 }
             )

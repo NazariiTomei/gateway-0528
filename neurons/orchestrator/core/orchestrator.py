@@ -65,7 +65,7 @@ from .worker_manager import WorkerManager
 # GatewayManager removed
 
 
-# SubnetCoreClient imports (BeamCore v2 contract)
+# SubnetCoreClient imports (BeamCore contract)
 try:
     from clients import (
         SubnetCoreClient,
@@ -842,7 +842,7 @@ class Orchestrator:
 
         proof.orchestrator_signature = self._sign_proof(proof)
 
-        # BeamCore v2 manages task lifecycle server-side: tasks are queued
+        # BeamCore manages task lifecycle server-side: tasks are queued
         # from WS chunk_assignments and completion is reflected from worker
         # task_result_summary pushes (see task-lifecycle.ts). No HTTP write needed.
 
@@ -951,7 +951,7 @@ class Orchestrator:
         if hasattr(self, "_sign_proof"):
             proof.orchestrator_signature = self._sign_proof(proof)
 
-        # BeamCore v2 manages task lifecycle server-side: tasks are queued
+        # BeamCore manages task lifecycle server-side: tasks are queued
         # from WS chunk_assignments and completion is reflected from worker
         # task_result_summary pushes (see task-lifecycle.ts). No HTTP write needed.
 
@@ -1193,8 +1193,7 @@ class Orchestrator:
             f"(previous epoch {prev_epoch}: {tasks} tasks, {bytes_relayed} bytes)"
         )
 
-    # Stale-task reassignment is owned by BeamCore v2 server-side
-    # (see the BeamCore V2 transfer-task guardrail implementation).
+    # Stale-task reassignment is owned by BeamCore server-side.
 
     # =========================================================================
     # State & Metrics
@@ -1334,7 +1333,7 @@ class Orchestrator:
 
             # WS push handlers. Transfer assignments are owned by the client
             # itself (`_handle_transfer_assigned` -> WS chunk_assignments) per
-            # the BeamCore v2 contract.
+            # the BeamCore contract.
             self.subnet_core_client.set_task_completion_handler(
                 self._handle_task_completion_notification
             )
@@ -1380,7 +1379,7 @@ class Orchestrator:
         Verifies the completion (worker match + bytes sanity) and updates
         local task / per-worker stats. Returning True triggers the
         ``acknowledge_task_completions`` ack in
-        ``SubnetCoreClient._handle_ws_message`` (BeamCore v2 task lifecycle).
+        ``SubnetCoreClient._handle_ws_message`` (BeamCore task lifecycle).
 
         Worker payment management is operator-defined.
         This handler updates local task and worker accounting.
@@ -1447,7 +1446,7 @@ class Orchestrator:
         return True
 
     # Transfer notification + chunk assignment is handled inside
-    # SubnetCoreClient._handle_transfer_assigned (BeamCore v2 WS push):
+    # SubnetCoreClient._handle_transfer_assigned (BeamCore WS push):
     # the client receives transfer_assigned, requests workers via WS
     # list_workers, and submits WS chunk_assignments. No HTTP path needed.
 

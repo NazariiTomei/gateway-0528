@@ -2,10 +2,8 @@
 Validator Core Logic - Unified Version
 
 Validates Proof-of-Bandwidth submissions and sets weights on the Bittensor network.
-Supports local mode (HTTP) and mainnet (Bittensor dendrite).
+Supports both local mode (HTTP) and mainnet (Bittensor dendrite).
 
-Uses SLA-based multiplicative penalty scoring for orchestrators and workers.
-Orchestrators failing SLA have rewards redirected to Orchestrator #1 (subnet treasury).
 """
 
 import asyncio
@@ -27,23 +25,16 @@ from core._beam_stubs import (
     BANDWIDTH_EMA_ALPHA,
     CANARY_SIZE_BYTES,
     # beam.constants
-    NEW_ORCHESTRATOR_GRACE_PERIOD_HOURS,
     SUBNET_ORCHESTRATOR_UID,
     # beam.protocol.synapse
     BandwidthChallenge,
     ChunkTransfer,
     OrchestratorManager,
-    OrchestratorSLAState,
     PoBVerificationResult,
     # beam.protocol.pob
     ProofOfBandwidth,
     ReassignmentManager,
-    SLALevel,
-    SLAMetrics,
-    SLARewardCalculator,
-    SLAScore,
     # Scoring helpers
-    SLAScorer,
     Task,
     WorkerRegistry,
     build_merkle_leaf,
@@ -95,9 +86,6 @@ class OrchestratorInfo:
     is_subnet_owned: bool = False  # True for UID #1
     last_score: float = 0.0
 
-    # SLA state
-    sla_state: Optional[OrchestratorSLAState] = None
-
 
 @dataclass
 class WorkSummary:
@@ -116,7 +104,7 @@ class WorkSummary:
     worker_regions: Dict[str, int]
     orchestrator_signature: str
 
-    # Extended SLA metrics (for full scoring)
+    # Extended work metrics
     uptime_percent: float = 100.0  # Orchestrator uptime over 24h window
     acceptance_rate: float = 100.0  # Task acceptance rate
     latency_p95_ms: float = 0.0  # 95th percentile latency
@@ -206,10 +194,7 @@ class Validator:
     - Generate bandwidth challenge tasks
     - Verify Proof-of-Bandwidth submissions
     - Fetch and verify proofs from SubnetCore API
-    - Calculate orchestrator and worker SLA scores
-    - Apply multiplicative penalties for SLA violations
-    - Redirect penalties to Orchestrator #1 (subnet treasury)
-    - Process worker reassignments
+    - Track orchestrator work and payment/fraud signals
     - Set weights on Bittensor network
 
     Supports both:
@@ -251,11 +236,8 @@ class Validator:
         self.worker_registry = WorkerRegistry()
         self.reassignment_manager = ReassignmentManager(self.worker_registry)
 
-        # SLA Scoring
-        self.sla_scorer = SLAScorer()
-        self.sla_reward_calculator = SLARewardCalculator(self.sla_scorer)
+        # Local score cache; BeamCore PRISM remains authoritative.
         self.orchestrator_scores: Dict[str, float] = {}  # hotkey -> final score
-        self.orchestrator_sla_scores: Dict[str, SLAScore] = {}  # hotkey -> SLA score
         self.payment_penalty_multipliers: Dict[str, float] = (
             {}
         )  # hotkey -> multiplier (1.0 = no penalty)
@@ -267,7 +249,7 @@ class Validator:
         # Sybil Detection
         self.sybil_detector = get_sybil_detector()
 
-        # Orchestrator SLA tracking (rolling 24h metrics)
+        # Orchestrator performance tracking (rolling window)
         self.orchestrator_metrics: Dict[int, Dict] = {}  # uid -> metrics accumulator
         self.worker_metrics: Dict[str, Dict] = {}  # worker_id -> metrics accumulator
 
@@ -349,14 +331,14 @@ class Validator:
         self.uid = 1
         self.is_registered = True
 
-        # Connect to subtensor
+        # Connect to subtensor for mainnet
         if self.settings.subtensor_address:
             self.subtensor = bt.Subtensor(network=self.settings.subtensor_address)
         else:
             self.subtensor = bt.Subtensor(network=self.settings.subtensor_network)
         logger.info(f"Connected to subtensor: {self.subtensor.network}")
 
-        # Load metagraph data
+        # Load metagraph for mainnet data
         try:
             self.metagraph = bt.Metagraph(
                 netuid=self.settings.netuid,
@@ -640,15 +622,6 @@ class Validator:
 
                 # Spot-check proofs
                 await self._spot_check_proofs()
-
-                # Update SLA metrics from task results
-                await self._update_sla_metrics()
-
-                # Calculate SLA scores with multiplicative penalties
-                await self._calculate_sla_scores()
-
-                # Process worker reassignments (SLA violations)
-                await self._process_reassignments()
 
                 # Update scores
                 await self._update_scores()
@@ -968,7 +941,8 @@ class Validator:
                     )
                     return result
             else:
-                # No signature provided; allow unsigned proofs until orchestrator signing is enforced.
+                # No signature provided - log warning but allow for now
+                # TODO: Make signatures required once orchestrator signing is implemented
                 logger.debug(f"No worker signature for {task_id[:16]}... (unsigned proof)")
                 result.signature_valid = True
 
@@ -1210,7 +1184,6 @@ class Validator:
             canary_offset=canary_offset,
             path=[connection["hotkey"]],
             expected_hops=1,
-            sla_level=0,
         )
 
         self.active_challenges[task_id] = {
@@ -1230,7 +1203,6 @@ class Validator:
             chunk_hash=bytes.fromhex(chunk_hash),
             chunk_size=self.settings.chunk_size_bytes,
             deadline=deadline_us,
-            sla_level=SLALevel.BEST_EFFORT,
             canary=canary,
             canary_offset=canary_offset,
             path=[connection["hotkey"]],
@@ -1248,7 +1220,7 @@ class Validator:
         self,
         orchestrator: OrchestratorInfo,
     ) -> Optional[ChallengeResult]:
-        """Bandwidth challenge flow has been removed from the BeamCore v2 validator path."""
+        """Bandwidth challenge flow has been removed from the BeamCore validator path."""
         logger.debug("Challenge flow is disabled for orchestrator %s", orchestrator.hotkey[:16])
         return None
 
@@ -1281,7 +1253,7 @@ class Validator:
         chunk_data: bytes,
         challenge: BandwidthChallenge,
     ) -> Optional[BandwidthChallenge]:
-        """Send challenge via Bittensor dendrite."""
+        """Send challenge via Bittensor dendrite (for mainnet)"""
         if self.dendrite is None or self.metagraph is None:
             return None
 
@@ -1847,140 +1819,16 @@ class Validator:
         return []
 
     # =========================================================================
-    # SLA Metrics and Scoring
-    # =========================================================================
-
-    async def _update_sla_metrics(self) -> None:
-        """Update SLA metrics for orchestrators and workers based on task results."""
-        for task_id, result in self.task_results.items():
-            if not result.valid:
-                continue
-
-            uid = self._get_uid_for_miner(result.pob.miner_id)
-            if uid is None:
-                continue
-
-            if uid not in self.orchestrator_metrics:
-                self.orchestrator_metrics[uid] = {
-                    "bandwidth_samples": [],
-                    "latency_samples": [],
-                    "task_count": 0,
-                    "success_count": 0,
-                    "accepted_count": 0,
-                    "offered_count": 0,
-                    "last_updated": datetime.utcnow(),
-                }
-
-            metrics = self.orchestrator_metrics[uid]
-
-            metrics["bandwidth_samples"].append(result.calculated_bandwidth)
-
-            if result.latency_ms:
-                metrics["latency_samples"].append(result.latency_ms)
-
-            metrics["task_count"] += 1
-            metrics["success_count"] += 1
-            metrics["last_updated"] = datetime.utcnow()
-
-            max_samples = 1000
-            if len(metrics["bandwidth_samples"]) > max_samples:
-                metrics["bandwidth_samples"] = metrics["bandwidth_samples"][-max_samples:]
-            if len(metrics["latency_samples"]) > max_samples:
-                metrics["latency_samples"] = metrics["latency_samples"][-max_samples:]
-
-        for task_id, challenge in self.active_challenges.items():
-            uid = challenge.get("uid")
-            if uid is None:
-                continue
-
-            if uid not in self.orchestrator_metrics:
-                self.orchestrator_metrics[uid] = {
-                    "bandwidth_samples": [],
-                    "latency_samples": [],
-                    "task_count": 0,
-                    "success_count": 0,
-                    "accepted_count": 0,
-                    "offered_count": 0,
-                    "last_updated": datetime.utcnow(),
-                }
-
-            metrics = self.orchestrator_metrics[uid]
-            metrics["offered_count"] += 1
-
-            if challenge.get("status") in ["accepted", "chunk_received"]:
-                metrics["accepted_count"] += 1
-
-    async def _calculate_sla_scores(self) -> None:
-        """Calculate SLA scores for all orchestrators using multiplicative penalties."""
-        if self.orchestrator_metrics:
-            logger.info(
-                f"_calculate_sla_scores: processing {len(self.orchestrator_metrics)} orchestrators"
-            )
-        for uid, metrics in self.orchestrator_metrics.items():
-            orchestrator = self.orchestrator_manager.get_orchestrator(uid)
-            if orchestrator is None:
-                continue
-
-            bandwidth_avg = 0.0
-            if metrics["bandwidth_samples"]:
-                bandwidth_avg = sum(metrics["bandwidth_samples"]) / len(
-                    metrics["bandwidth_samples"]
-                )
-
-            success_rate = 0.0
-            if metrics["task_count"] > 0:
-                success_rate = (metrics["success_count"] / metrics["task_count"]) * 100
-
-            acceptance_rate = 0.0
-            if metrics["offered_count"] > 0:
-                acceptance_rate = (metrics["accepted_count"] / metrics["offered_count"]) * 100
-
-            last_updated = metrics["last_updated"]
-            if isinstance(last_updated, str):
-                last_updated = datetime.fromisoformat(last_updated.replace("Z", "+00:00")).replace(
-                    tzinfo=None
-                )
-            hours_since_update = (datetime.utcnow() - last_updated).total_seconds() / 3600
-            uptime = 99.0 if hours_since_update < 1 else max(50.0, 99.0 - hours_since_update * 2)
-
-            sla_metrics = SLAMetrics.from_latency_samples(
-                latency_samples=metrics["latency_samples"],
-                uptime_percent=uptime,
-                bandwidth_mbps=bandwidth_avg,
-                acceptance_rate_percent=acceptance_rate,
-                success_rate_percent=success_rate,
-                measurement_start=metrics.get(
-                    "window_start", datetime.utcnow() - timedelta(hours=24)
-                ),
-                measurement_end=datetime.utcnow(),
-            )
-
-            self.orchestrator_manager.update_orchestrator_metrics(uid, sla_metrics)
-
-    async def _process_reassignments(self) -> None:
-        """Process worker reassignments due to SLA violations."""
-        new_requests = self.reassignment_manager.check_and_queue_sla_reassignments()
-
-        if new_requests:
-            logger.info(f"Queued {len(new_requests)} new worker reassignments")
-
-        completed = self.reassignment_manager.process_pending_reassignments()
-
-        if completed:
-            logger.info(f"Completed {len(completed)} worker reassignments")
-
-    # =========================================================================
     # Scoring
     # =========================================================================
 
     async def _update_scores(self) -> None:
-        """Update Orchestrator scores using full SLA-based multiplicative penalties."""
+        """Update local orchestrator scores from work, challenge, fraud, and payment signals."""
         logger.info(
             f"_update_scores: scoring {len(self.orchestrators)} orchestrators, {len(self.work_summaries)} with summaries"
         )
 
-        # Fetch baseline multiplier from SubnetCore (authoritative, not locally editable)
-        _baseline_multiplier = 0.1  # hardcoded fallback
+        _baseline_multiplier = 0.1
         if self.subnet_core_client:
             try:
                 net_config = await self.subnet_core_client.get_network_config()
@@ -1993,92 +1841,33 @@ class Validator:
             summary = self.work_summaries.get(hotkey)
 
             if not summary:
-                # Give idle orchestrators a minimal baseline so they appear in weights
-                baseline_multiplier = _baseline_multiplier
-                if info.is_subnet_owned:
-                    baseline_multiplier = 1.0
-                final_score = baseline_multiplier
+                final_score = 1.0 if info.is_subnet_owned else _baseline_multiplier
                 self.orchestrator_scores[hotkey] = final_score
                 info.last_score = final_score
                 logger.info(
                     f"_update_scores: {hotkey[:16]}... UID={info.uid} "
-                    f"no work summary — baseline score={final_score:.4f}"
+                    f"no work summary - baseline score={final_score:.4f}"
                 )
                 continue
 
-            metrics = SLAMetrics(
-                uptime_percent=summary.uptime_percent,
-                bandwidth_mbps=summary.avg_bandwidth_mbps,
-                latency_p95_ms=(
-                    summary.latency_p95_ms if summary.latency_p95_ms > 0 else summary.avg_latency_ms
-                ),
-                acceptance_rate_percent=summary.acceptance_rate,
-                success_rate_percent=summary.success_rate * 100,
-                packet_loss_percent=0.0,
-                measurement_start=summary.measurement_start,
-                measurement_end=summary.measurement_end,
-                sample_count=summary.total_tasks,
-            )
-
-            logger.debug(
-                f"_update_scores: {hotkey[:16]}... SLA metrics: "
-                f"uptime={metrics.uptime_percent:.1f}% bw={metrics.bandwidth_mbps:.1f}Mbps "
-                f"latency_p95={metrics.latency_p95_ms:.1f}ms accept={metrics.acceptance_rate_percent:.1f}% "
-                f"success={metrics.success_rate_percent:.1f}% samples={metrics.sample_count}"
-            )
-
-            sla_state = OrchestratorSLAState(
-                uid=info.uid or 0,
-                hotkey=hotkey,
-                metrics=metrics,
-                is_subnet_owned=info.is_subnet_owned,
-                registered_at=info.registered_at,
-                grace_period_ends=(
-                    info.registered_at + timedelta(hours=NEW_ORCHESTRATOR_GRACE_PERIOD_HOURS)
-                    if info.registered_at
-                    else None
-                ),
-            )
-
-            sla_score = self.sla_scorer.score_orchestrator(sla_state)
-
+            throughput_score = min(max(summary.avg_bandwidth_mbps / 1000.0, 0.0), 1.0)
+            reliability_score = min(max(summary.success_rate, 0.0), 1.0)
+            work_score = (throughput_score * 0.6) + (reliability_score * 0.4)
             challenge_multiplier = self._calculate_challenge_multiplier(hotkey)
             fraud_multiplier = self._calculate_fraud_multiplier(hotkey)
             payment_multiplier = self.payment_penalty_multipliers.get(hotkey, 1.0)
+            final_score = work_score * challenge_multiplier * fraud_multiplier * payment_multiplier
 
-            effective_multiplier = (
-                sla_score.effective_multiplier
-                * challenge_multiplier
-                * fraud_multiplier
-                * payment_multiplier
-            )
-
-            final_score = effective_multiplier
-
-            self.orchestrator_sla_scores[hotkey] = sla_score
             self.orchestrator_scores[hotkey] = final_score
             info.last_score = final_score
-            info.sla_state = sla_state
-            sla_state.score = sla_score
 
             logger.info(
                 f"_update_scores: {hotkey[:16]}... UID={info.uid} "
-                f"sla_mult={sla_score.effective_multiplier:.4f} "
+                f"work_score={work_score:.4f} "
                 f"challenge_mult={challenge_multiplier:.4f} "
                 f"fraud_mult={fraud_multiplier:.4f} "
                 f"payment_mult={payment_multiplier:.4f} "
-                f"combined_mult={effective_multiplier:.4f} "
                 f"final_score={final_score:.6f}"
-                + (
-                    f" violations={[v.value for v in sla_score.violations]}"
-                    if sla_score.violations
-                    else ""
-                )
-                + (
-                    f" redirect={sla_score.penalty_redirect_percent:.1f}%"
-                    if sla_score.penalty_redirect_percent > 0
-                    else ""
-                )
             )
 
         # Also update connection scores for legacy compatibility
@@ -2424,30 +2213,11 @@ class Validator:
         }
 
     def get_orchestrator_scores(self) -> Dict[str, dict]:
-        """Get all orchestrator SLA scores"""
+        """Get all local orchestrator scores."""
         result = {}
 
         for hotkey, info in self.orchestrators.items():
             uid = self._get_uid_for_hotkey(hotkey)
-
-            sla_score = self.orchestrator_sla_scores.get(hotkey)
-            sla_details = None
-            if sla_score:
-                sla_details = {
-                    "effective_multiplier": round(sla_score.effective_multiplier, 4),
-                    "combined_multiplier": round(sla_score.combined_multiplier, 4),
-                    "penalty_redirect_percent": round(sla_score.penalty_redirect_percent, 2),
-                    "violations": [v.value for v in sla_score.violations],
-                    "in_grace_period": sla_score.in_grace_period,
-                    "multipliers": {
-                        "uptime": round(sla_score.multipliers.uptime, 4),
-                        "bandwidth": round(sla_score.multipliers.bandwidth, 4),
-                        "latency": round(sla_score.multipliers.latency, 4),
-                        "acceptance": round(sla_score.multipliers.acceptance, 4),
-                        "success": round(sla_score.multipliers.success, 4),
-                    },
-                }
-
             result[hotkey] = {
                 "uid": uid,
                 "score": round(self.orchestrator_scores.get(hotkey, 0), 4),
@@ -2456,7 +2226,6 @@ class Validator:
                 "is_subnet_owned": info.is_subnet_owned,
                 "last_seen": info.last_seen.isoformat(),
                 "registered": uid is not None,
-                "sla": sla_details,
             }
 
         return result

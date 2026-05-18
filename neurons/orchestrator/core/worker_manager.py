@@ -81,21 +81,21 @@ class WorkerManager:
             logger.warning("Max workers limit reached")
             return None
 
-        # BeamCore v2: workers self-register via POST /workers/register and
+        # BeamCore: workers self-register via POST /workers/register and
         # own their worker_id end-to-end. The orchestrator no longer
         # forwards a registration request; it just resolves the worker_id by
-        # looking it up locally (worker_id == hotkey for v2 affiliation).
+        # looking it up locally (worker_id == hotkey for affiliation).
         # The canonical worker record lives in BeamCore and can be fetched
         # via GET /orchestrators/workers when needed.
         worker_id = hotkey
         if subnet_core_client is None:
             logger.debug(
                 f"Registering worker {hotkey[:16]}... locally (no SubnetCore client; "
-                f"v2 workers self-register via POST /workers/register)"
+                f"workers self-register via POST /workers/register)"
             )
         else:
             logger.debug(
-                f"Registering worker {hotkey[:16]}... locally; v2 server-side "
+                f"Registering worker {hotkey[:16]}... locally; server-side "
                 f"registration is performed by the worker itself"
             )
 

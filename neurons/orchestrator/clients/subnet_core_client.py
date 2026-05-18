@@ -156,7 +156,7 @@ class SubnetCoreClient:
         self._ws_ping_timeout = ws_ping_timeout
         self._client: Optional[httpx.AsyncClient] = None
 
-        # WebSocket push handlers (v2 contract: task_result_summary via WS, worker_update via WS)
+        # WebSocket push handlers (task_result_summary via WS, worker_update via WS)
         self._task_completion_handler: Optional[Callable] = None
         self._worker_update_handler: Optional[Callable] = (
             None  # Handler for worker connect/disconnect push events
@@ -397,7 +397,7 @@ class SubnetCoreClient:
         """
         Start WebSocket connection for real-time notifications.
 
-        BeamCore v2 pushes transfers (`transfer_assigned`) and task results
+        BeamCore pushes transfers (`transfer_assigned`) and task results
         (`task_result_summary`) over the orchestrator WebSocket — there is no HTTP
         polling fallback.
         """
@@ -773,12 +773,12 @@ class SubnetCoreClient:
                 logger.warning(f"No compatible workers available for assignment {assignment_id}")
                 return
 
-            def sla_score(worker: dict[str, Any]) -> float:
+            def worker_score(worker: dict[str, Any]) -> float:
                 trust = worker["trust_score"]
                 bandwidth = worker["bandwidth_mbps"]
                 return trust * min(2.0, bandwidth / 100.0)
 
-            sorted_workers = sorted(normalized_workers, key=sla_score, reverse=True)
+            sorted_workers = sorted(normalized_workers, key=worker_score, reverse=True)
             worker_ids = [worker["worker_id"] for worker in sorted_workers]
 
             assignments = [
@@ -1113,10 +1113,10 @@ class SubnetCoreClient:
     async def get_worker(self, worker_id: str) -> Dict[str, Any]:
         """Get a specific worker.
 
-        BeamCore v2 exposes the worker globally at GET /workers/{worker_id}
-        (see the BeamCore V2 worker route implementation). The
+        BeamCore exposes the worker globally at GET /workers/{worker_id}.
+        The
         legacy /orchestrators/workers/{id} affiliation-scoped route was
-        removed in v2.
+        removed.
         """
         return await self._send_ws_request({"type": "get_worker", "worker_id": worker_id})
 
