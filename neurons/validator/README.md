@@ -16,7 +16,6 @@ pip install -e ".[validator]"
 
 ```bash
 BEAM_VALIDATOR_CORE_SERVER_URL=https://beamcore.b1m.ai
-BEAM_VALIDATOR_SUBNET_CORE_API_KEY=<your-api-key>
 SUBTENSOR_NETWORK=finney
 NETUID=105
 BEAM_VALIDATOR_WALLET_NAME=your_coldkey
@@ -35,7 +34,6 @@ python main.py
 | Variable | Description | Default |
 | -------- | ----------- | ------- |
 | `BEAM_VALIDATOR_CORE_SERVER_URL` | Beam control-plane HTTP base | `https://beamcore.b1m.ai` |
-| `BEAM_VALIDATOR_SUBNET_CORE_API_KEY` | API key for PoB proof routes — required for proof verification and scoring | *(none)* |
 | `SUBTENSOR_NETWORK` | Bittensor network | `finney` |
 | `NETUID` | BEAM subnet UID | `105` |
 | `BEAM_VALIDATOR_WALLET_NAME` | Bittensor coldkey name | `default` |

@@ -3,11 +3,9 @@ BeamCore HTTP client for the validator neuron.
 
 Authentication
 --------------
-`/pob/*` and related control-plane routes (`GET /pob`, `POST /pob/{id}/verify`, …) authenticate with
-`x-api-key` (`subnet_core_api_key`), alongside operators and automation clients.
-
-`POST /validators/heartbeat` and `GET /Validator/epoch-summary/latest-epoch` authenticate with validator
-hotkey signatures via the standard header fields.
+All routes authenticate with validator hotkey signatures via the standard header fields
+(`X-Validator-Hotkey`, `X-Validator-Signature`, `X-Validator-Timestamp`, `X-Validator-Nonce`,
+`X-Validator-Action`).
 
 `set_weights` and recommended-weight logic read the signed **epoch-summary** response. PoB endpoints cover
 proof listing and verification.
@@ -82,29 +80,11 @@ class SubnetCoreClient:
         path_only = path.split("?", 1)[0]
         lower = path_only.lower()
 
-        if lower.startswith("/pob"):
-            headers: Dict[str, str] = {}
-            if self._api_key:
-                headers["x-api-key"] = self._api_key
-            if "headers" in kwargs:
-                headers.update(kwargs.pop("headers"))
-            req_kwargs = dict(kwargs)
-            return await client.request(method, f"{self.base_url}{path}", headers=headers, **req_kwargs)
-
-        if lower.startswith("/validators/heartbeat") or lower.startswith("/validator/epoch-summary"):
-            headers = self._signed_headers(action)
-            if "headers" in kwargs:
-                headers.update(kwargs.pop("headers"))
-            req_kwargs = dict(kwargs)
-            return await client.request(method, f"{self.base_url}{path}", headers=headers, **req_kwargs)
-
-        # Default (e.g. legacy paths): try signature if wallet present, else minimal
+        # All routes use validator hotkey signature
         try:
             headers = self._signed_headers(action) if self.wallet else {"X-Validator-Hotkey": self.validator_hotkey}
         except RuntimeError:
             headers = {"X-Validator-Hotkey": self.validator_hotkey}
-        if self._api_key:
-            headers.setdefault("x-api-key", self._api_key)
         if "headers" in kwargs:
             headers.update(kwargs.pop("headers"))
         return await client.request(method, f"{self.base_url}{path}", headers=headers, **kwargs)
