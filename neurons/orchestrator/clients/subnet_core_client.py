@@ -789,7 +789,7 @@ class SubnetCoreClient:
             try:
                 response = await self._send_ws_request(
                     {
-                        "type": "list_public_worker",
+                        "type": "list_public_workers",
                         "transfer_id": transfer_id,
                         "request_id": request_id,
                     },
@@ -1130,14 +1130,14 @@ class SubnetCoreClient:
     # Worker Management
     # =========================================================================
 
-    async def list_public_worker(
+    async def list_public_workers(
         self,
         status: Optional[str] = None,
         region: Optional[str] = None,
         limit: int = 100,
     ) -> Dict[str, Any]:
         """List workers on the public worker gateway eligible for this orchestrator."""
-        payload: dict[str, Any] = {"type": "list_public_worker", "limit": limit}
+        payload: dict[str, Any] = {"type": "list_public_workers", "limit": limit}
         if status:
             payload["status"] = status
         if region:
