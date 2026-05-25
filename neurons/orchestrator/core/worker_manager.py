@@ -517,7 +517,7 @@ class WorkerManager:
             return 0
 
         try:
-            workers_data = await subnet_core_client.list_workers(status="active")
+            workers_data = await subnet_core_client.list_public_worker(status="active")
             workers_list = workers_data.get("workers", [])
 
             if not workers_list:
