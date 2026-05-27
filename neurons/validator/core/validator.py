@@ -343,7 +343,7 @@ class Validator:
         try:
             self.metagraph = bt.Metagraph(
                 netuid=self.settings.netuid,
-                network=self.subtensor.network,
+                network=self.subtensor.chain_endpoint,
             )
             self.metagraph.sync(subtensor=self.subtensor)
             logger.debug(f"Metagraph loaded with {len(self.metagraph.hotkeys)} neurons")
@@ -404,7 +404,7 @@ class Validator:
         # Load metagraph
         self.metagraph = bt.Metagraph(
             netuid=self.settings.netuid,
-            network=self.subtensor.network,
+            network=self.subtensor.chain_endpoint,
         )
         self.metagraph.sync(subtensor=self.subtensor)
 
