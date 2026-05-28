@@ -658,7 +658,8 @@ class SubnetCoreClient:
                 (request_id or "")[:16] if isinstance(request_id, str) else request_id,
             )
 
-        # Some BeamCore push messages may include request_id. Never treat push as a request/reply.
+        # Some BeamCore push messages include request_id. We MUST still resolve any pending
+        # request future so _send_ws_request() doesn't time out and retry.
         push_types = {
             "connected",
             "task_result_summary",
@@ -674,11 +675,15 @@ class SubnetCoreClient:
             "error",
         }
 
-        if request_id and msg_type not in push_types:
+        if request_id:
             fut = self._pending_ws_requests.pop(request_id, None)
             if fut and not fut.done():
                 fut.set_result(data)
-                return
+                # For pure request/reply messages, stop here.
+                # For push-types that also carry request_id (e.g. chunks_queued),
+                # continue so normal push handling runs too.
+                if msg_type not in push_types:
+                    return
 
         if msg_type == "connected":
             logger.info(
@@ -1074,17 +1079,18 @@ class SubnetCoreClient:
                             "Failed to queue chunk_assignments for assignment %s after %s attempts: %s",
                             assignment_id,
                             max_attempts,
-                            e,
+                            repr(e),
                         )
                         return
                     delay = min(30.0, 2.0 * attempt)
                     logger.warning(
                         "Failed to queue chunk_assignments for assignment %s "
-                        "(attempt %s/%s): %s; retrying in %.1fs",
+                        "(attempt %s/%s): %s(%s); retrying in %.1fs",
                         assignment_id,
                         attempt,
                         max_attempts,
-                        e,
+                        type(e).__name__,
+                        repr(e),
                         delay,
                     )
                     await asyncio.sleep(delay)
