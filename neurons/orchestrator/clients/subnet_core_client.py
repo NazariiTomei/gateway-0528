@@ -1042,11 +1042,36 @@ class SubnetCoreClient:
 
             sorted_workers = sorted(normalized_workers, key=worker_score, reverse=True)
             worker_ids = [worker["worker_id"] for worker in sorted_workers]
+            logger.info(
+                "dedicated worker pool (sorted): %s",
+                [wid[:8] for wid in worker_ids],
+            )
 
             assignments = [
                 {"chunk_index": i, "worker_id": worker_ids[i % len(worker_ids)]}
                 for i in range(chunk_start, chunk_end + 1)
             ]
+            if assignments:
+                logger.info(
+                    "chunk_assignments preview: assignment=%s transfer=%s chunks=%s-%s mapping=%s",
+                    assignment_id,
+                    transfer_id,
+                    chunk_start,
+                    chunk_end,
+                    {a["chunk_index"]: a["worker_id"][:8] for a in assignments[:10]},
+                )
+
+            # Watchdog: if we never receive worker_task_offer after queueing,
+            # transfers will appear to "expire" with no further logs.
+            async def _warn_if_no_offers() -> None:
+                await asyncio.sleep(25)
+                logger.warning(
+                    "No worker_task_offer received yet: transfer=%s assignment=%s. "
+                    "Likely causes: orch-gateway websocket dropped, BeamCore failed to generate execution_context, "
+                    "or upstream error. Check for orch-ws error logs and gateway task_offer delivered logs.",
+                    transfer_id,
+                    assignment_id,
+                )
 
             max_attempts = 5
             for attempt in range(1, max_attempts + 1):
@@ -1082,6 +1107,7 @@ class SubnetCoreClient:
                         len(assignments),
                         assignment_id,
                     )
+                    asyncio.create_task(_warn_if_no_offers())
                     return
                 except Exception as e:
                     if attempt >= max_attempts:
