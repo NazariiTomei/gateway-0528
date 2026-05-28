@@ -517,18 +517,33 @@ class WorkerManager:
             return 0
 
         try:
-            workers_data = await subnet_core_client.list_public_workers(status="active")
-            workers_list = workers_data.get("workers", [])
+            # Dedicated-only policy: when a dedicated worker gateway is configured,
+            # do NOT sync from BeamCore public worker pool.
+            if getattr(subnet_core_client, "uses_dedicated_worker_gateway", lambda: False)():
+                gw_client = getattr(subnet_core_client, "_worker_gateway_client", None)
+                if not gw_client:
+                    logger.warning(
+                        "Dedicated gateway enabled but control session not ready; no workers synced"
+                    )
+                    return 0
+                workers_list = await gw_client.list_workers(timeout=30.0)
+            else:
+                workers_data = await subnet_core_client.list_public_workers(status="active")
+                workers_list = workers_data.get("workers", [])
 
             if not workers_list:
-                logger.info("No workers returned from SubnetCore")
+                logger.info("No workers returned from worker sync source")
                 return 0
+
+            # Track seen worker IDs so we can mark missing ones offline for dedicated pools.
+            seen_worker_ids: set[str] = set()
 
             synced = 0
             for w in workers_list:
                 worker_id = w.get("worker_id", "")
                 if not worker_id:
                     continue
+                seen_worker_ids.add(worker_id)
 
                 # Update or create worker in local cache
                 if worker_id in self.workers:
@@ -570,8 +585,22 @@ class WorkerManager:
 
                 synced += 1
 
+            # Dedicated pools: mark workers missing from gateway as offline.
+            if getattr(subnet_core_client, "uses_dedicated_worker_gateway", lambda: False)():
+                for worker_id, worker in self.workers.items():
+                    if worker_id not in seen_worker_ids and worker.status == WorkerStatus.ACTIVE:
+                        worker.status = WorkerStatus.OFFLINE
+
+            sync_source = (
+                "dedicated gateway"
+                if getattr(subnet_core_client, "uses_dedicated_worker_gateway", lambda: False)()
+                else "BeamCore public pool"
+            )
             logger.info(
-                f"Synced {synced} workers from SubnetCore (total in cache: {len(self.workers)})"
+                "Synced %s workers from %s (total in cache: %s)",
+                synced,
+                sync_source,
+                len(self.workers),
             )
             return synced
 
