@@ -641,7 +641,40 @@ class SubnetCoreClient:
         msg_type = data.get("type")
         request_id = data.get("request_id")
 
-        if request_id:
+        # High-signal trace so operators can follow the lifecycle.
+        # (Keep this INFO — it's critical for diagnosing "expired" transfers.)
+        if msg_type in (
+            "transfer_assigned",
+            "chunks_queued",
+            "worker_task_offer",
+            "worker_response_ack",
+            "task_result_summary_ack",
+            "task_result_summary",
+            "error",
+        ):
+            logger.info(
+                "orch-ws inbound: type=%s request_id=%s",
+                msg_type,
+                (request_id or "")[:16] if isinstance(request_id, str) else request_id,
+            )
+
+        # Some BeamCore push messages may include request_id. Never treat push as a request/reply.
+        push_types = {
+            "connected",
+            "task_result_summary",
+            "worker_update",
+            "transfer_assigned",
+            "chunks_queued",
+            "worker_task_offer",
+            "worker_response_ack",
+            "task_result_summary_ack",
+            "upstream_down",
+            "upstream_ok",
+            "ping",
+            "error",
+        }
+
+        if request_id and msg_type not in push_types:
             fut = self._pending_ws_requests.pop(request_id, None)
             if fut and not fut.done():
                 fut.set_result(data)
