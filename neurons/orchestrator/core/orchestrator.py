@@ -402,6 +402,7 @@ class Orchestrator:
 
         # SubnetCoreClient for API-based data operations
         self.subnet_core_client: Optional[Any] = None
+        self.worker_gateway_client: Optional[Any] = None
 
         # Async control
         self._running: bool = False
@@ -572,6 +573,10 @@ class Orchestrator:
                 await task
             except asyncio.CancelledError:
                 pass
+
+        if self.worker_gateway_client:
+            await self.worker_gateway_client.stop()
+            self.worker_gateway_client = None
 
         if SUBNET_CORE_CLIENT_AVAILABLE and self.subnet_core_client:
             # Stop HTTP polling
@@ -1368,9 +1373,78 @@ class Orchestrator:
             await self.subnet_core_client.start_polling()
             logger.info("SubnetCore WebSocket connection started")
 
+            await self._init_worker_gateway_client()
+
         except Exception as e:
             logger.warning(f"Failed to initialize SubnetCoreClient: {e}")
             self.subnet_core_client = None
+
+    async def _init_worker_gateway_client(self) -> None:
+        """Connect orchestrator control plane to a dedicated worker gateway."""
+        control_url = self.settings.worker_gateway_control_url
+        control_secret = (self.settings.worker_gateway_control_secret or "").strip()
+        public_url = (self.settings.worker_gateway_public_url or "").strip()
+
+        if not control_url or not control_secret:
+            if public_url:
+                logger.warning(
+                    "WORKER_GATEWAY_PUBLIC_URL is set but WORKER_GATEWAY_CONTROL_URL / "
+                    "WORKER_GATEWAY_CONTROL_SECRET are missing — dedicated gateway relay disabled"
+                )
+            return
+
+        try:
+            from clients.worker_gateway_client import WorkerGatewayClient
+
+            self.worker_gateway_client = WorkerGatewayClient(
+                control_url=control_url,
+                control_secret=control_secret,
+                open_timeout=self.settings.orch_ws_open_timeout,
+                ping_interval=self.settings.orch_ws_ping_interval,
+                ping_timeout=self.settings.orch_ws_ping_timeout,
+            )
+            self.worker_gateway_client.set_worker_response_handler(
+                self._relay_gateway_worker_response
+            )
+            self.worker_gateway_client.set_task_result_summary_handler(
+                self._relay_gateway_task_result_summary
+            )
+            await self.worker_gateway_client.start()
+            self.subnet_core_client.set_worker_gateway_client(self.worker_gateway_client)
+            logger.info(
+                "Dedicated worker gateway enabled: public=%s control=%s",
+                public_url or "(unset)",
+                control_url,
+            )
+
+            if public_url and self.subnet_core_client:
+                try:
+                    await self.subnet_core_client.update_worker_gateway(
+                        gateway_url=public_url,
+                        max_workers=self.settings.max_workers,
+                    )
+                    logger.info("Published worker gateway URL to BeamCore: %s", public_url)
+                except Exception as exc:
+                    logger.warning("gateway_update failed (will retry on reconnect): %s", exc)
+        except Exception as exc:
+            logger.error("Failed to initialize dedicated worker gateway client: %s", exc)
+            self.worker_gateway_client = None
+
+    async def _relay_gateway_worker_response(self, data: dict) -> None:
+        if not self.subnet_core_client:
+            return
+        try:
+            await self.subnet_core_client.relay_worker_response(data)
+        except Exception as exc:
+            logger.error("Failed to relay worker_response to BeamCore: %s", exc)
+
+    async def _relay_gateway_task_result_summary(self, data: dict) -> None:
+        if not self.subnet_core_client:
+            return
+        try:
+            await self.subnet_core_client.relay_task_result_summary(data)
+        except Exception as exc:
+            logger.error("Failed to relay task_result_summary to BeamCore: %s", exc)
 
     async def _handle_task_completion_notification(self, message: dict) -> bool:
         """

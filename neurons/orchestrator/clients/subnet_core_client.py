@@ -191,6 +191,9 @@ class SubnetCoreClient:
         # orch-gateway → BeamCore upstream relay (independent of orch ↔ orch-gateway edge socket)
         self._beamcore_upstream_degraded: bool = False
 
+        # Optional orchestrator-owned worker gateway (dedicated pool)
+        self._worker_gateway_client: Optional[Any] = None
+
     # =========================================================================
     # Handlers for polling notifications
     # =========================================================================
@@ -203,6 +206,13 @@ class SubnetCoreClient:
         Returns True if task is verified and should be acknowledged.
         """
         self._task_completion_handler = handler
+
+    def set_worker_gateway_client(self, client: Any) -> None:
+        """Attach dedicated worker-gateway control client for orch-owned deployments."""
+        self._worker_gateway_client = client
+
+    def uses_dedicated_worker_gateway(self) -> bool:
+        return self._worker_gateway_client is not None
 
     def set_worker_update_handler(self, handler: Callable):
         """
@@ -679,6 +689,15 @@ class SubnetCoreClient:
             self._note_beamcore_upstream_recovered("transfer_assigned from BeamCore")
             asyncio.create_task(self._handle_transfer_assigned(data))
 
+        elif msg_type == "worker_task_offer":
+            asyncio.create_task(self._handle_worker_task_offer(data))
+
+        elif msg_type == "worker_response_ack":
+            asyncio.create_task(self._handle_worker_response_ack(data))
+
+        elif msg_type == "task_result_summary_ack":
+            asyncio.create_task(self._handle_task_result_summary_ack(data))
+
         elif msg_type == "chunks_queued":
             self._note_beamcore_upstream_recovered("chunks_queued from BeamCore path")
             logger.info(
@@ -772,6 +791,113 @@ class SubnetCoreClient:
 
         return response
 
+    async def _handle_worker_task_offer(self, data: dict) -> None:
+        """Relay BeamCore task offers to workers on a dedicated gateway."""
+        client = self._worker_gateway_client
+        if not client:
+            logger.warning(
+                "Received worker_task_offer but no dedicated gateway client is configured"
+            )
+            return
+
+        worker_id = data.get("worker_id")
+        offer = data.get("offer") or {}
+        if not worker_id or not offer:
+            logger.warning("Malformed worker_task_offer: missing worker_id or offer")
+            return
+
+        try:
+            delivered = await client.send_task_offer(worker_id, offer)
+            if not delivered:
+                logger.warning(
+                    "Failed to deliver task offer to worker %s task=%s",
+                    worker_id,
+                    offer.get("task_id"),
+                )
+        except Exception as exc:
+            logger.error("worker_task_offer relay failed: %s", exc)
+
+    async def _handle_worker_response_ack(self, data: dict) -> None:
+        """Forward BeamCore lease ack to worker via dedicated gateway."""
+        client = self._worker_gateway_client
+        if not client:
+            return
+
+        worker_id = data.get("worker_id")
+        task_id = data.get("task_id")
+        offer_id = data.get("offer_id") or task_id
+        accepted = bool(data.get("accepted", True))
+        reason = data.get("reason") or data.get("message") or ""
+
+        if not worker_id:
+            return
+
+        try:
+            await client.send_task_accept_ack(
+                worker_id, task_id, offer_id, accepted, reason=reason
+            )
+        except Exception as exc:
+            logger.error("worker_response_ack forward failed: %s", exc)
+
+    async def _handle_task_result_summary_ack(self, data: dict) -> None:
+        """Forward BeamCore result ack to worker via dedicated gateway."""
+        client = self._worker_gateway_client
+        if not client:
+            return
+
+        worker_id = data.get("worker_id")
+        task_id = data.get("task_id")
+        offer_id = data.get("offer_id") or task_id
+        received = bool(data.get("received", False))
+        reason = data.get("reason") or data.get("message") or ""
+
+        if not worker_id:
+            return
+
+        try:
+            await client.send_task_result_summary_ack(
+                worker_id, task_id, offer_id, received, reason=reason
+            )
+        except Exception as exc:
+            logger.error("task_result_summary_ack forward failed: %s", exc)
+
+    async def relay_worker_response(self, data: dict) -> dict:
+        """Relay worker accept/reject from dedicated gateway to BeamCore."""
+        message = {
+            "type": "worker_response",
+            "task_id": data.get("task_id"),
+            "offer_id": data.get("offer_id") or data.get("task_id"),
+            "worker_id": data.get("worker_id"),
+            "decision": data.get("decision") or "task_accept",
+        }
+        if data.get("reason"):
+            message["reason"] = data["reason"]
+        return await self._send_ws_request(message, timeout=max(30.0, float(self.timeout)))
+
+    async def relay_task_result_summary(self, data: dict) -> dict:
+        """Relay worker task completion from dedicated gateway to BeamCore."""
+        message = {
+            "type": "task_result_summary",
+            "task_id": data.get("task_id"),
+            "offer_id": data.get("offer_id") or data.get("task_id"),
+            "worker_id": data.get("worker_id"),
+            "success": bool(data.get("success", False)),
+            "bytes_transferred": int(data.get("bytes_transferred", 0) or 0),
+            "bandwidth_mbps": float(data.get("bandwidth_mbps", 0.0) or 0.0),
+        }
+        for key in (
+            "chunk_hash",
+            "error",
+            "duration_ms",
+            "latency_ms",
+            "start_time_us",
+            "end_time_us",
+            "etag",
+        ):
+            if data.get(key) is not None:
+                message[key] = data[key]
+        return await self._send_ws_request(message, timeout=max(30.0, float(self.timeout)))
+
     async def _handle_transfer_assigned(self, data: dict) -> None:
         assignment_id = data.get("assignment_id")
         transfer_id = data.get("transfer_id")
@@ -786,19 +912,33 @@ class SubnetCoreClient:
                 logger.error(f"No WS connection for transfer_assigned {transfer_id}")
                 return
 
-            try:
-                response = await self._send_ws_request(
-                    {
-                        "type": "list_public_workers",
-                        "transfer_id": transfer_id,
-                        "request_id": request_id,
-                    },
-                    timeout=max(30.0, float(self.timeout)),
-                )
-                workers = response.get("workers", [])
-            except Exception as e:
-                logger.error(f"Failed to get worker list for transfer {transfer_id}: {e}")
-                return
+            workers: list[dict[str, Any]] = []
+            if self._worker_gateway_client:
+                try:
+                    workers = await self._worker_gateway_client.list_workers(
+                        timeout=max(30.0, float(self.timeout))
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to list dedicated gateway workers for transfer %s: %s",
+                        transfer_id,
+                        e,
+                    )
+                    return
+            else:
+                try:
+                    response = await self._send_ws_request(
+                        {
+                            "type": "list_public_workers",
+                            "transfer_id": transfer_id,
+                            "request_id": request_id,
+                        },
+                        timeout=max(30.0, float(self.timeout)),
+                    )
+                    workers = response.get("workers", [])
+                except Exception as e:
+                    logger.error(f"Failed to get worker list for transfer {transfer_id}: {e}")
+                    return
 
             normalized_workers = _normalize_worker_list(workers, transfer_id)
             if not normalized_workers:

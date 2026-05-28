@@ -120,6 +120,14 @@ class OrchestratorSettings(BaseSettings):
 
     worker_gateway_public_url: Optional[str] = Field(default=None, env="WORKER_GATEWAY_PUBLIC_URL")
 
+    # Dedicated gateway control plane (orchestrator -> /control WebSocket)
+    worker_gateway_control_url: Optional[str] = Field(
+        default=None, env="WORKER_GATEWAY_CONTROL_URL"
+    )
+    worker_gateway_control_secret: Optional[str] = Field(
+        default=None, env="WORKER_GATEWAY_CONTROL_SECRET"
+    )
+
     # ==========================================================================
     # Worker Scoring Weights (for selection)
     # ==========================================================================
