@@ -12,9 +12,9 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from config import GatewaySettings, get_settings
@@ -48,19 +48,6 @@ class GatewayState:
     def __init__(self) -> None:
         self.workers: Dict[str, WorkerSession] = {}
         self.control: Optional[ControlSession] = None
-        self._worker_event_handlers: List[Callable[[dict], Any]] = []
-
-    def on_worker_event(self, handler: Callable[[dict], Any]) -> None:
-        self._worker_event_handlers.append(handler)
-
-    async def notify_worker_event(self, message: dict) -> None:
-        for handler in self._worker_event_handlers:
-            try:
-                result = handler(message)
-                if asyncio.iscoroutine(result):
-                    await result
-            except Exception as exc:
-                logger.error("Worker event handler failed: %s", exc)
 
     def list_worker_records(self) -> List[dict]:
         now = time.time()
@@ -81,26 +68,70 @@ class GatewayState:
     async def send_to_worker(self, worker_id: str, payload: dict) -> bool:
         session = self.workers.get(worker_id)
         if not session:
+            logger.warning("task_offer for offline worker %s", worker_id)
             return False
-        async with session.send_lock:
-            await session.websocket.send_json(payload)
-        return True
+        try:
+            async with session.send_lock:
+                await session.websocket.send_json(payload)
+            return True
+        except Exception as exc:
+            logger.error("Failed to send to worker %s: %s", worker_id, exc)
+            return False
 
     async def send_to_control(self, payload: dict) -> bool:
         if not self.control:
-            logger.warning("No orchestrator control session; drop %s", payload.get("type"))
+            logger.debug("No control session; drop %s", payload.get("type"))
             return False
-        async with self.control.send_lock:
-            await self.control.websocket.send_json(payload)
-        return True
+        try:
+            async with self.control.send_lock:
+                await self.control.websocket.send_json(payload)
+            return True
+        except Exception as exc:
+            logger.error("Failed to send to control plane: %s", exc)
+            return False
 
 
 gateway_state = GatewayState()
 
 
-def create_app(settings: Optional[GatewaySettings] = None) -> FastAPI:
+async def _close_worker_socket(
+    websocket: WebSocket,
+    *,
+    code: int,
+    reason: str,
+    error_message: Optional[str] = None,
+) -> None:
+    """Close a worker socket after accept() — never close before accept (breaks proxies)."""
+    if error_message:
+        try:
+            await websocket.send_json({"type": "error", "message": error_message})
+        except Exception:
+            pass
+    try:
+        await websocket.close(code=code, reason=reason)
+    except Exception:
+        pass
+
+
+def create_app(
+    settings: Optional[GatewaySettings] = None,
+    *,
+    control_secret: Optional[str] = None,
+) -> FastAPI:
     settings = settings or get_settings()
+    resolved_secret = (control_secret or settings.control_secret or "").strip()
     app = FastAPI(title="BEAM Worker Gateway", version="0.1.0")
+
+    @app.get("/")
+    async def root() -> JSONResponse:
+        return JSONResponse(
+            {
+                "service": "BEAM Worker Gateway",
+                "health": "/health",
+                "worker_ws": "/ws/{worker_id}",
+                "control_ws": "/control",
+            }
+        )
 
     @app.get("/health")
     async def health() -> JSONResponse:
@@ -110,6 +141,7 @@ def create_app(settings: Optional[GatewaySettings] = None) -> FastAPI:
                 "workers_connected": len(gateway_state.workers),
                 "control_connected": gateway_state.control is not None,
                 "public_url": settings.public_url,
+                "require_api_key": settings.require_worker_api_key,
             }
         )
 
@@ -119,18 +151,23 @@ def create_app(settings: Optional[GatewaySettings] = None) -> FastAPI:
         worker_id: str,
         api_key: Optional[str] = Query(default=None),
     ) -> None:
+        # Always accept first — closing before accept causes bad HTTP status / 502 behind Caddy.
+        await websocket.accept()
+
         if settings.require_worker_api_key and not (api_key or "").strip():
-            await websocket.close(code=4401, reason="api_key required")
+            logger.warning("Worker %s rejected: missing api_key query param", worker_id)
+            await _close_worker_socket(
+                websocket,
+                code=4401,
+                reason="api_key required",
+                error_message="api_key required",
+            )
             return
 
         if worker_id in gateway_state.workers:
             old = gateway_state.workers.pop(worker_id)
-            try:
-                await old.websocket.close(code=4000, reason="replaced")
-            except Exception:
-                pass
+            await _close_worker_socket(old.websocket, code=4000, reason="replaced")
 
-        await websocket.accept()
         session = WorkerSession(
             worker_id=worker_id,
             websocket=websocket,
@@ -221,6 +258,8 @@ def create_app(settings: Optional[GatewaySettings] = None) -> FastAPI:
 
         except WebSocketDisconnect:
             logger.info("Worker disconnected: %s", worker_id)
+        except Exception as exc:
+            logger.exception("Worker session error %s: %s", worker_id, exc)
         finally:
             gateway_state.workers.pop(worker_id, None)
             await gateway_state.send_to_control(
@@ -232,21 +271,31 @@ def create_app(settings: Optional[GatewaySettings] = None) -> FastAPI:
         websocket: WebSocket,
         x_control_secret: Optional[str] = Header(default=None, alias="x-control-secret"),
     ) -> None:
-        secret = (settings.control_secret or "").strip()
-        if not secret:
-            await websocket.close(code=1011, reason="gateway control secret not configured")
+        await websocket.accept()
+
+        if not resolved_secret:
+            logger.error("Control connection rejected: WORKER_GATEWAY_CONTROL_SECRET not set")
+            await _close_worker_socket(
+                websocket,
+                code=1011,
+                reason="control secret not configured",
+                error_message="control secret not configured",
+            )
             return
-        if (x_control_secret or "").strip() != secret:
-            await websocket.close(code=4403, reason="invalid control secret")
+
+        if (x_control_secret or "").strip() != resolved_secret:
+            logger.warning("Control connection rejected: invalid x-control-secret")
+            await _close_worker_socket(
+                websocket,
+                code=4403,
+                reason="invalid control secret",
+                error_message="invalid control secret",
+            )
             return
 
         if gateway_state.control:
-            try:
-                await gateway_state.control.websocket.close(code=4000, reason="replaced")
-            except Exception:
-                pass
+            await _close_worker_socket(gateway_state.control.websocket, code=4000, reason="replaced")
 
-        await websocket.accept()
         gateway_state.control = ControlSession(websocket=websocket)
         logger.info("Orchestrator control connected")
 
@@ -287,6 +336,7 @@ def create_app(settings: Optional[GatewaySettings] = None) -> FastAPI:
                                 "type": "task_offer_result",
                                 "success": False,
                                 "reason": "missing worker_id",
+                                "request_id": data.get("request_id"),
                             }
                         )
                         continue
@@ -306,9 +356,8 @@ def create_app(settings: Optional[GatewaySettings] = None) -> FastAPI:
 
                 if msg_type in ("task_accept_ack", "task_result_summary_ack"):
                     worker_id = data.get("worker_id")
-                    if not worker_id:
-                        continue
-                    await gateway_state.send_to_worker(worker_id, data)
+                    if worker_id:
+                        await gateway_state.send_to_worker(worker_id, data)
                     continue
 
                 if msg_type == "ping":
@@ -319,6 +368,8 @@ def create_app(settings: Optional[GatewaySettings] = None) -> FastAPI:
 
         except WebSocketDisconnect:
             logger.info("Orchestrator control disconnected")
+        except Exception as exc:
+            logger.exception("Control session error: %s", exc)
         finally:
             if gateway_state.control and gateway_state.control.websocket is websocket:
                 gateway_state.control = None
@@ -332,7 +383,7 @@ async def _relay_worker_response(
     decision: str,
     reason: str = "",
 ) -> None:
-    """Forward worker accept/reject to orchestrator; acks come back via control plane."""
+    """Forward worker accept/reject to orchestrator; BeamCore acks return via control plane."""
     task_id = data.get("task_id")
     offer_id = data.get("offer_id") or task_id
     payload: dict[str, Any] = {

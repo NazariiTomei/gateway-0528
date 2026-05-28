@@ -4,19 +4,27 @@ Run the orchestrator-owned worker gateway.
   cd neurons/worker_gateway
   python main.py
 
-Workers connect to wss://<public-host>/ws/{worker_id}?api_key=...
-Orchestrator connects to wss://<host>/control with header x-control-secret.
+Workers:  wss://<host>/ws/{worker_id}?api_key=...
+Orch:     wss://<host>/control  (header x-control-secret)
 """
+
+from __future__ import annotations
 
 import logging
 import os
 import secrets
 import sys
+from pathlib import Path
 
 import uvicorn
 
-from config import get_settings
-from server import create_app
+# Ensure this package directory is importable when started from any cwd.
+_GATEWAY_DIR = Path(__file__).resolve().parent
+if str(_GATEWAY_DIR) not in sys.path:
+    sys.path.insert(0, str(_GATEWAY_DIR))
+
+from config import get_settings  # noqa: E402
+from server import create_app  # noqa: E402
 
 LOG_DIR = os.environ.get("LOG_DIR", "/tmp/beam_worker_gateway_logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -30,28 +38,37 @@ logging.getLogger().addHandler(file_handler)
 logger = logging.getLogger(__name__)
 
 
+def _resolve_control_secret(settings) -> str:
+    secret = (settings.control_secret or os.environ.get("WORKER_GATEWAY_CONTROL_SECRET") or "").strip()
+    if secret:
+        return secret
+    generated = secrets.token_urlsafe(32)
+    os.environ["WORKER_GATEWAY_CONTROL_SECRET"] = generated
+    logger.warning(
+        "WORKER_GATEWAY_CONTROL_SECRET was not set — generated one for this process. "
+        "Copy it to the orchestrator .env."
+    )
+    print(f"\n*** Set on orchestrator: WORKER_GATEWAY_CONTROL_SECRET={generated}\n")
+    return generated
+
+
 def main() -> None:
     settings = get_settings()
-    logging.getLogger().setLevel(settings.log_level)
+    log_level = settings.normalized_log_level()
+    logging.getLogger().setLevel(log_level)
 
-    if not (settings.control_secret or "").strip():
-        generated = secrets.token_urlsafe(32)
-        logger.warning(
-            "WORKER_GATEWAY_CONTROL_SECRET is not set — generated ephemeral secret for this "
-            "process only. Set the same value on the orchestrator."
-        )
-        settings.control_secret = generated
-        print(f"\n*** Set on orchestrator: WORKER_GATEWAY_CONTROL_SECRET={generated}\n")
-
-    app = create_app(settings)
+    control_secret = _resolve_control_secret(settings)
+    app = create_app(settings, control_secret=control_secret)
 
     print(
         f"""
 ╔═══════════════════════════════════════════════════╗
 ║           BEAM WORKER GATEWAY                     ║
-║  Workers:  /ws/{{worker_id}}?api_key=...           ║
-║  Control:  /control  (x-control-secret)           ║
-║  Public:   {settings.public_url or '(set WORKER_GATEWAY_PUBLIC_URL)'}
+║  Listen:   {settings.host}:{settings.port}
+║  Workers:  /ws/{{worker_id}}?api_key=...
+║  Control:  /control  (x-control-secret)
+║  Health:   /health
+║  Public:   {settings.public_url or "(set WORKER_GATEWAY_PUBLIC_URL)"}
 ╚═══════════════════════════════════════════════════╝
 """
     )
@@ -60,7 +77,10 @@ def main() -> None:
         app,
         host=settings.host,
         port=settings.port,
-        log_level=settings.log_level.lower(),
+        log_level=log_level.lower(),
+        # Required when running behind Caddy / nginx TLS termination
+        proxy_headers=True,
+        forwarded_allow_ips="*",
     )
 
 

@@ -104,7 +104,16 @@ WantedBy=multi-user.target
 
 | Symptom | Fix |
 | ------- | --- |
+| **HTTP 502** on `/health` or worker WebSocket | Gateway process not running on port 8001, or Caddy `reverse_proxy` points at the wrong host/port. Run `curl http://127.0.0.1:8001/health` on the Caddy host first. |
+| Worker WebSocket **4401** after connect | Missing `?api_key=` — worker must register with BeamCore first; or set `GATEWAY_REQUIRE_API_KEY=false` only for debugging. |
 | `409 task_not_completed` on payment evidence | Orchestrator not relaying `worker_response` / `task_result_summary` — check control secret and orch logs |
-| Worker HTTP 403 on `/ws/...` | Missing or wrong `api_key` query param from BeamCore registration |
 | `control_connected: false` | `WORKER_GATEWAY_CONTROL_SECRET` mismatch or orchestrator cannot reach control URL |
 | No tasks | `READY=true`, workers connected, orchestrator registered on subnet 105 |
+
+**502 almost always means Caddy cannot reach uvicorn.** Start the gateway before testing workers:
+
+```bash
+cd neurons/worker_gateway && python main.py
+# In another shell on the same host as Caddy:
+curl -s http://127.0.0.1:8001/health
+```
