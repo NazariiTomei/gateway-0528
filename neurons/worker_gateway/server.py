@@ -73,6 +73,13 @@ class GatewayState:
         try:
             async with session.send_lock:
                 await session.websocket.send_json(payload)
+            if payload.get("type") == "task_offer":
+                logger.info(
+                    "task_offer delivered: worker=%s task=%s offer=%s",
+                    worker_id,
+                    (payload.get("task_id") or "")[:16],
+                    (payload.get("offer_id") or "")[:16],
+                )
             return True
         except Exception as exc:
             logger.error("Failed to send to worker %s: %s", worker_id, exc)
@@ -245,6 +252,15 @@ def create_app(
                     continue
 
                 if msg_type == "task_result_summary":
+                    logger.info(
+                        "task_result_summary from worker: worker=%s task=%s offer=%s success=%s bytes=%s mbps=%.1f",
+                        worker_id,
+                        (data.get("task_id") or "")[:16],
+                        (data.get("offer_id") or data.get("task_id") or "")[:16],
+                        bool(data.get("success", False)),
+                        int(data.get("bytes_transferred", 0) or 0),
+                        float(data.get("bandwidth_mbps", 0.0) or 0.0),
+                    )
                     await gateway_state.send_to_control({**data, "worker_id": worker_id})
                     continue
 
@@ -409,6 +425,13 @@ async def _relay_worker_response(
     }
     if reason:
         payload["reason"] = reason
+    logger.info(
+        "worker_response from worker: worker=%s task=%s offer=%s decision=%s",
+        session.worker_id,
+        (task_id or "")[:16],
+        (offer_id or "")[:16],
+        decision,
+    )
     await gateway_state.send_to_control(payload)
 
     if decision == "task_reject":

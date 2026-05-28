@@ -805,6 +805,14 @@ class SubnetCoreClient:
         if not worker_id or not offer:
             logger.warning("Malformed worker_task_offer: missing worker_id or offer")
             return
+        logger.info(
+            "worker_task_offer: worker=%s task=%s offer=%s transfer=%s chunk=%s",
+            worker_id,
+            (offer.get("task_id") or "")[:16],
+            (offer.get("offer_id") or "")[:16],
+            (offer.get("transfer_id") or "")[:16],
+            offer.get("chunk_index"),
+        )
 
         try:
             delivered = await client.send_task_offer(worker_id, offer)
@@ -863,6 +871,13 @@ class SubnetCoreClient:
 
     async def relay_worker_response(self, data: dict) -> dict:
         """Relay worker accept/reject from dedicated gateway to BeamCore."""
+        logger.info(
+            "relay worker_response: worker=%s task=%s offer=%s decision=%s",
+            (data.get("worker_id") or "")[:36],
+            (data.get("task_id") or "")[:16],
+            (data.get("offer_id") or data.get("task_id") or "")[:16],
+            data.get("decision"),
+        )
         message = {
             "type": "worker_response",
             "task_id": data.get("task_id"),
@@ -876,6 +891,15 @@ class SubnetCoreClient:
 
     async def relay_task_result_summary(self, data: dict) -> dict:
         """Relay worker task completion from dedicated gateway to BeamCore."""
+        logger.info(
+            "relay task_result_summary: worker=%s task=%s offer=%s success=%s bytes=%s mbps=%.1f",
+            (data.get("worker_id") or "")[:36],
+            (data.get("task_id") or "")[:16],
+            (data.get("offer_id") or data.get("task_id") or "")[:16],
+            bool(data.get("success", False)),
+            int(data.get("bytes_transferred", 0) or 0),
+            float(data.get("bandwidth_mbps", 0.0) or 0.0),
+        )
         message = {
             "type": "task_result_summary",
             "task_id": data.get("task_id"),
