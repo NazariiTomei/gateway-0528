@@ -913,32 +913,27 @@ class SubnetCoreClient:
                 return
 
             workers: list[dict[str, Any]] = []
-            if self._worker_gateway_client:
-                try:
-                    workers = await self._worker_gateway_client.list_workers(
-                        timeout=max(30.0, float(self.timeout))
-                    )
-                except Exception as e:
-                    logger.error(
-                        "Failed to list dedicated gateway workers for transfer %s: %s",
-                        transfer_id,
-                        e,
-                    )
-                    return
-            else:
-                try:
-                    response = await self._send_ws_request(
-                        {
-                            "type": "list_public_workers",
-                            "transfer_id": transfer_id,
-                            "request_id": request_id,
-                        },
-                        timeout=max(30.0, float(self.timeout)),
-                    )
-                    workers = response.get("workers", [])
-                except Exception as e:
-                    logger.error(f"Failed to get worker list for transfer {transfer_id}: {e}")
-                    return
+            if not self._worker_gateway_client:
+                # Dedicated-only policy: never fall back to list_public_workers.
+                logger.error(
+                    "Dedicated gateway required but not configured/connected. "
+                    "Refusing transfer_assigned: transfer=%s assignment=%s",
+                    transfer_id,
+                    assignment_id,
+                )
+                return
+
+            try:
+                workers = await self._worker_gateway_client.list_workers(
+                    timeout=max(30.0, float(self.timeout))
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to list dedicated gateway workers for transfer %s: %s",
+                    transfer_id,
+                    e,
+                )
+                return
 
             normalized_workers = _normalize_worker_list(workers, transfer_id)
             if not normalized_workers:

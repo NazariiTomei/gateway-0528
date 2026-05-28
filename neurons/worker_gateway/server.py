@@ -145,6 +145,20 @@ def create_app(
             }
         )
 
+    @app.get("/workers")
+    async def workers() -> JSONResponse:
+        """
+        List workers currently connected to this gateway.
+
+        This is an operator/debug endpoint (read-only) and does not include any secrets.
+        """
+        return JSONResponse(
+            {
+                "count": len(gateway_state.workers),
+                "workers": gateway_state.list_worker_records(),
+            }
+        )
+
     @app.websocket("/ws/{worker_id}")
     async def worker_ws(
         websocket: WebSocket,
