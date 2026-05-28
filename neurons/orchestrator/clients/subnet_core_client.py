@@ -773,15 +773,25 @@ class SubnetCoreClient:
                 await self._ws.send(json.dumps({"type": "pong"}))
 
         elif msg_type == "error":
+            # Always log full error payload at INFO/WARN so operators can
+            # correlate "expired" transfers with upstream failures.
+            code = data.get("code") or data.get("error") or "error"
+            reason = data.get("reason") or ""
+            message = data.get("message") or data.get("detail") or ""
+            logger.warning(
+                "orch-ws error: code=%s reason=%s message=%s request_id=%s payload=%s",
+                code,
+                reason,
+                message,
+                (request_id or "")[:16] if isinstance(request_id, str) else request_id,
+                {k: v for k, v in data.items() if k not in {"signature", "api_key"}},
+            )
             if data.get("code") == "unauthorized":
                 logger.warning(
-                    "Orch-gateway authorization rejected hotkey %s: reason=%s message=%s",
+                    "Orch-gateway authorization rejected hotkey %s",
                     data.get("hotkey") or self.orchestrator_hotkey,
-                    data.get("reason"),
-                    data.get("message"),
                 )
-            else:
-                self._maybe_upstream_error_payload(data)
+            self._maybe_upstream_error_payload(data)
 
         else:
             logger.debug(f"Unknown WebSocket message type: {msg_type}")
