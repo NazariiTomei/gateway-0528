@@ -1585,17 +1585,30 @@ def get_config():
     config = bt.Config(parser)
     return config
 
+def get_wallet():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--wallet.name", dest="wallet_name")
+    parser.add_argument("--wallet.hotkey", dest="wallet_hotkey")
+
+    args = parser.parse_args()
+
+    wallet = bt.Wallet(
+        name=args.wallet_name,
+        hotkey=args.wallet_hotkey,
+    )
+
+    return wallet
 
 async def main():
     """Main entry point."""
-    print("Beam Network Worker")
-    print("=" * 40)
+    wallet = get_wallet()
 
-    # Parse configuration
-    config = get_config()
+    print(wallet.name)
+    print(wallet.hotkey_str)
 
     # Load bittensor wallet
-    wallet = bt.Wallet(config=config)
+    # wallet = bt.Wallet(config=config)
     print(f"Wallet name: {wallet.name}")
     print(f"Hotkey name: {wallet.hotkey_str}")
 
