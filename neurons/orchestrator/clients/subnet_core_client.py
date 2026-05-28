@@ -928,8 +928,31 @@ class SubnetCoreClient:
         chunk_start = int(data.get("chunk_start", 0))
         chunk_end = int(data.get("chunk_end", 0))
         request_id = assignment_id or transfer_id
+        upstream_gateway_url = (data.get("gateway_url") or "").strip()
 
         logger.info(f"transfer_assigned: transfer={transfer_id} chunks={chunk_start}-{chunk_end}")
+        if upstream_gateway_url:
+            logger.info("transfer_assigned gateway_url=%s", upstream_gateway_url)
+
+        expected_gateway_url = ""
+        try:
+            expected_gateway_url = (self._registration_config or {}).get("gateway_url") or ""
+        except Exception:
+            expected_gateway_url = ""
+        expected_gateway_url = expected_gateway_url.strip()
+        if expected_gateway_url and upstream_gateway_url and expected_gateway_url.rstrip("/") != upstream_gateway_url.rstrip("/"):
+            logger.warning(
+                "transfer_assigned gateway_url mismatch: expected=%s got=%s. "
+                "BeamCore may still be routing offers via a different gateway; tasks can expire.",
+                expected_gateway_url,
+                upstream_gateway_url,
+            )
+            # Best-effort republish to BeamCore in case of stale routing state.
+            try:
+                await self.update_worker_gateway(expected_gateway_url, max_workers=self._registration_config.get("max_workers", 10000))
+                logger.info("Republished gateway_url via gateway_update: %s", expected_gateway_url)
+            except Exception as exc:
+                logger.warning("gateway_update retry failed: %s", exc)
 
         try:
             if not self._ws:
