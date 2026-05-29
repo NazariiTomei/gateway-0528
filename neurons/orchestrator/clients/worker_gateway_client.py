@@ -292,6 +292,7 @@ class WorkerGatewayClient:
             "task_id": task_id,
             "offer_id": offer_id,
             "received": received,
+            "completed": received,
         }
         if reason:
             payload["reason"] = reason

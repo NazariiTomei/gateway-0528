@@ -200,7 +200,11 @@ class SubnetCoreClient:
         # task_id -> worker_id / transfer_id for ack relay and result persistence
         self._task_worker_ids: dict[str, str] = {}
         self._task_transfer_ids: dict[str, str] = {}
+        self._task_chunk_indices: dict[str, int] = {}
+        self._transfer_assignment_ids: dict[str, str] = {}
         self._result_relay_inflight: set[str] = set()
+        # task_id -> terminal relay outcome ("ok" or BeamCore reason) — blocks duplicate relays
+        self._result_relay_terminal: dict[str, str] = {}
 
     def _worker_offer_id(self, task_id: Optional[str], ack_offer_id: Optional[str]) -> str:
         """Resolve offer_id for worker-facing acks when BeamCore echoes task_id instead."""
@@ -927,6 +931,12 @@ class SubnetCoreClient:
             self._task_worker_ids[str(task_id_for_cache)] = str(worker_id)
         if task_id_for_cache and transfer_id:
             self._task_transfer_ids[str(task_id_for_cache)] = str(transfer_id)
+        chunk_index = offer.get("chunk_index")
+        if task_id_for_cache is not None and chunk_index is not None:
+            try:
+                self._task_chunk_indices[str(task_id_for_cache)] = int(chunk_index)
+            except (TypeError, ValueError):
+                pass
 
         logger.info(
             "worker_task_offer: worker=%s task=%s offer=%s transfer=%s chunk=%s",
@@ -1105,12 +1115,79 @@ class SubnetCoreClient:
         )
         return response
 
+    def _build_task_result_relay_message(self, data: dict) -> dict[str, Any]:
+        """Build BeamCore-facing task_result_summary with assignment context."""
+        task_id = data.get("task_id")
+        worker_id = data.get("worker_id")
+        bytes_val = int(data.get("bytes_transferred", 0) or data.get("bytes_relayed", 0) or 0)
+        message: dict[str, Any] = {
+            "type": "task_result_summary",
+            "task_id": task_id,
+            "offer_id": data.get("offer_id") or data.get("task_id"),
+            "worker_id": worker_id,
+            "orchestrator_hotkey": self.orchestrator_hotkey,
+            "success": bool(data.get("success", False)),
+            "bytes_transferred": bytes_val,
+            "bytes_relayed": bytes_val,
+            "bandwidth_mbps": float(data.get("bandwidth_mbps", 0.0) or 0.0),
+        }
+        transfer_id = None
+        if task_id:
+            transfer_id = self._task_transfer_ids.get(str(task_id))
+            if transfer_id:
+                message["transfer_id"] = transfer_id
+                assignment_id = self._transfer_assignment_ids.get(transfer_id)
+                if assignment_id:
+                    message["assignment_id"] = assignment_id
+            chunk_index = data.get("chunk_index")
+            if chunk_index is None and task_id:
+                chunk_index = self._task_chunk_indices.get(str(task_id))
+            if chunk_index is not None:
+                message["chunk_index"] = int(chunk_index)
+        for key in (
+            "chunk_hash",
+            "error",
+            "duration_ms",
+            "latency_ms",
+            "start_time_us",
+            "end_time_us",
+            "etag",
+            "transfer_id",
+            "assignment_id",
+            "chunk_index",
+            "stream_id",
+        ):
+            if data.get(key) is not None:
+                message[key] = data[key]
+        return message
+
     async def relay_task_result_summary(self, data: dict) -> dict:
         """Relay worker task completion from dedicated gateway to BeamCore."""
         task_id = data.get("task_id")
         worker_id = data.get("worker_id")
         if task_id and worker_id:
             self._task_worker_ids[str(task_id)] = str(worker_id)
+
+        if task_id and str(task_id) in self._result_relay_terminal:
+            prior = self._result_relay_terminal[str(task_id)]
+            logger.info(
+                "task_result_summary relay skipped (prior outcome=%s): task=%s",
+                prior,
+                (str(task_id))[:16],
+            )
+            response = {
+                "type": "task_result_summary_ack",
+                "task_id": task_id,
+                "received": prior == "ok",
+                "reason": None if prior == "ok" else prior,
+            }
+            await self._forward_task_result_summary_ack_to_worker(
+                worker_id=worker_id,
+                task_id=task_id,
+                offer_id=data.get("offer_id"),
+                response=response,
+            )
+            return response
 
         if task_id and str(task_id) in self._result_relay_inflight:
             logger.info(
@@ -1124,52 +1201,37 @@ class SubnetCoreClient:
                 "reason": "duplicate_inflight",
             }
 
+        message = self._build_task_result_relay_message(data)
         logger.info(
-            "relay task_result_summary: worker=%s task=%s offer=%s success=%s bytes=%s mbps=%.1f",
+            "relay task_result_summary: worker=%s task=%s offer=%s success=%s bytes=%s "
+            "chunk_index=%s chunk_hash=%s assignment=%s",
             (data.get("worker_id") or "")[:36],
             (task_id or "")[:16],
             (data.get("offer_id") or data.get("task_id") or "")[:16],
             bool(data.get("success", False)),
-            int(data.get("bytes_transferred", 0) or 0),
-            float(data.get("bandwidth_mbps", 0.0) or 0.0),
+            int(message.get("bytes_transferred", 0) or 0),
+            message.get("chunk_index"),
+            "yes" if message.get("chunk_hash") else "no",
+            (str(message.get("assignment_id") or ""))[:16] or "-",
         )
-        message = {
-            "type": "task_result_summary",
-            "task_id": task_id,
-            "offer_id": data.get("offer_id") or data.get("task_id"),
-            "worker_id": worker_id,
-            "success": bool(data.get("success", False)),
-            "bytes_transferred": int(data.get("bytes_transferred", 0) or 0),
-            "bandwidth_mbps": float(data.get("bandwidth_mbps", 0.0) or 0.0),
-        }
-        if task_id:
-            transfer_id = self._task_transfer_ids.get(str(task_id))
-            if transfer_id:
-                message["transfer_id"] = transfer_id
-        for key in (
-            "chunk_hash",
-            "error",
-            "duration_ms",
-            "latency_ms",
-            "start_time_us",
-            "end_time_us",
-            "etag",
-            "transfer_id",
-        ):
-            if data.get(key) is not None:
-                message[key] = data[key]
         if task_id:
             self._result_relay_inflight.add(str(task_id))
         try:
             response = await self._send_ws_request(
-                message, timeout=max(30.0, float(self.timeout))
+                message, timeout=max(60.0, float(self.timeout))
             )
+            received = bool(response.get("received", False))
+            reason = response.get("reason") or response.get("message") or ""
+            if task_id:
+                self._result_relay_terminal[str(task_id)] = "ok" if received else (reason or "rejected")
             logger.info(
-                "relay task_result_summary ack from BeamCore: type=%s task=%s received=%s reason=%s",
+                "relay task_result_summary ack from BeamCore: type=%s task=%s received=%s "
+                "completed=%s reason=%s",
                 response.get("type"),
                 (response.get("task_id") or task_id or "")[:16],
-                response.get("received"),
-                response.get("reason") or response.get("message") or "-",
+                received,
+                response.get("completed"),
+                reason or "-",
             )
             await self._forward_task_result_summary_ack_to_worker(
                 worker_id=worker_id,
@@ -1191,6 +1253,8 @@ class SubnetCoreClient:
         upstream_gateway_url = (data.get("gateway_url") or "").strip()
 
         logger.info(f"transfer_assigned: transfer={transfer_id} chunks={chunk_start}-{chunk_end}")
+        if transfer_id and assignment_id:
+            self._transfer_assignment_ids[str(transfer_id)] = str(assignment_id)
         if upstream_gateway_url:
             logger.info("transfer_assigned gateway_url=%s", upstream_gateway_url)
 

@@ -164,6 +164,15 @@ class TaskExecutionResult:
     error_msg: Optional[str] = None
 
 
+@dataclass
+class TaskSummaryAck:
+    """BeamCore task_result_summary_ack fields used for payment gating."""
+
+    received: bool = False
+    completed: bool = False
+    reason: Optional[str] = None
+
+
 def task_label(task_id: Optional[str]) -> str:
     """Short task label for logs."""
     return task_id[:16] if task_id else "unknown"
@@ -1126,6 +1135,7 @@ async def ws_send_task_result(
     etag: str = None,
     error: str = None,
     offer_id: str = None,
+    chunk_index: Optional[int] = None,
 ) -> bool:
     """Send fast task completion summary over WebSocket."""
     try:
@@ -1136,12 +1146,15 @@ async def ws_send_task_result(
             "worker_id": state.worker_id,
             "success": success,
             "bytes_transferred": bytes_transferred,
+            "bytes_relayed": bytes_transferred,
             "bandwidth_mbps": bandwidth_mbps,
             "start_time_us": start_time_us,
             "end_time_us": end_time_us,
             "latency_ms": duration_ms,
             "duration_ms": int(duration_ms),
         }
+        if chunk_index is not None:
+            msg["chunk_index"] = int(chunk_index)
         if chunk_hash:
             msg["chunk_hash"] = chunk_hash
         if etag:
@@ -1169,8 +1182,9 @@ async def finalize_ws_task_result(
     etag: str = None,
     error: str = None,
     offer_id: str = None,
+    chunk_index: Optional[int] = None,
 ) -> bool:
-    """Send a fast task result summary over WS and retry on the same WS if the ack is delayed."""
+    """Send task_result_summary and wait for BeamCore ack (received / completed)."""
     result_key = offer_id or task_id
 
     for attempt in range(3):
@@ -1192,20 +1206,33 @@ async def finalize_ws_task_result(
                 etag=etag,
                 error=error,
                 offer_id=offer_id,
+                chunk_index=chunk_index,
             )
             if not sent:
                 continue
 
             try:
-                received = await asyncio.wait_for(ack_future, timeout=WS_TASK_RESULT_ACK_TIMEOUT)
-                if received:
+                ack = await asyncio.wait_for(ack_future, timeout=WS_TASK_RESULT_ACK_TIMEOUT)
+                if not isinstance(ack, TaskSummaryAck):
+                    ack = TaskSummaryAck(received=bool(ack))
+                if ack.completed:
+                    print(
+                        f"[Worker] [WS] Task completed on BeamCore: {task_label(task_id)} "
+                        f"offer={task_label(offer_id)}"
+                    )
+                    return True
+                if ack.received:
                     print(
                         f"[Worker] [WS] Task result acked: {task_label(task_id)} offer={task_label(offer_id)}"
                     )
                     return True
+                reason = ack.reason or "not_received"
                 print(
-                    f"[Worker] [WS] Task result nack from gateway: {task_label(task_id)} offer={task_label(offer_id)}"
+                    f"[Worker] [WS] Task result nack from gateway: {task_label(task_id)} "
+                    f"offer={task_label(offer_id)} reason={reason}"
                 )
+                if reason == "persist_timeout":
+                    break
             except asyncio.TimeoutError:
                 print(
                     f"[Worker] [WS] Task result ack timeout "
@@ -1253,6 +1280,10 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
     task_key = offer_id or task_id
     deadline_us = task.get("deadline_us", 0)
     execution_context = task.get("execution_context", {})
+    chunk_indices = execution_context.get("chunk_indices") or []
+    chunk_index = task.get("chunk_index")
+    if chunk_index is None and chunk_indices:
+        chunk_index = chunk_indices[0]
     estimated_bytes = estimate_task_bytes(task, execution_context)
     reserved_capacity = False
 
@@ -1336,6 +1367,7 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
             etag=result.etag,
             error=result.error_msg,
             offer_id=offer_id,
+            chunk_index=chunk_index,
         )
 
         if result.success and summary_acked:
@@ -1445,7 +1477,19 @@ async def websocket_loop(state: WorkerState):
                             elif msg_type == "task_result_summary_ack":
                                 ack_task_id = message.get("task_id")
                                 ack_offer_id = message.get("offer_id") or ack_task_id
-                                received = message.get("received", False)
+                                received = bool(message.get("received", False))
+                                completed_raw = message.get("completed")
+                                completed = (
+                                    bool(completed_raw)
+                                    if completed_raw is not None
+                                    else received
+                                )
+                                reason = message.get("reason")
+                                ack = TaskSummaryAck(
+                                    received=received,
+                                    completed=completed,
+                                    reason=str(reason) if reason else None,
+                                )
                                 result_key = None
                                 for key in (ack_offer_id, ack_task_id):
                                     if key and key in state.pending_task_results:
@@ -1454,11 +1498,12 @@ async def websocket_loop(state: WorkerState):
                                 if result_key:
                                     future = state.pending_task_results.pop(result_key)
                                     if not future.done():
-                                        future.set_result(bool(received))
+                                        future.set_result(ack)
                                 if not received:
                                     print(
                                         f"[Worker] [WS] Gateway rejected task_result_summary: "
-                                        f"task={task_label(ack_task_id)} offer={task_label(ack_offer_id)}"
+                                        f"task={task_label(ack_task_id)} offer={task_label(ack_offer_id)} "
+                                        f"reason={ack.reason or 'unknown'}"
                                     )
 
                             elif msg_type == "error":
