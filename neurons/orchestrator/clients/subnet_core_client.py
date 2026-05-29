@@ -667,6 +667,9 @@ class SubnetCoreClient:
             "transfer_assigned",
             "chunks_queued",
             "worker_task_offer",
+            "worker_task_offers",
+            "task_offers",
+            "task_offer",
             "worker_response_ack",
             "task_result_summary_ack",
             "upstream_down",
@@ -729,6 +732,43 @@ class SubnetCoreClient:
 
         elif msg_type == "worker_task_offer":
             asyncio.create_task(self._handle_worker_task_offer(data))
+
+        elif msg_type in ("worker_task_offers", "task_offers"):
+            # Some BeamCore builds may batch offers under a plural type.
+            offers = data.get("offers") or data.get("worker_task_offers") or []
+            if not offers and data.get("offer"):
+                offers = [data]
+            logger.info(
+                "orch-ws inbound: batched offers type=%s count=%s",
+                msg_type,
+                len(offers),
+            )
+            for item in offers:
+                if isinstance(item, dict):
+                    payload = (
+                        item
+                        if item.get("offer") or item.get("type") == "worker_task_offer"
+                        else {"worker_id": item.get("worker_id"), "offer": item}
+                    )
+                    if payload.get("type") != "worker_task_offer":
+                        payload = {
+                            "type": "worker_task_offer",
+                            "worker_id": payload.get("worker_id"),
+                            "offer": payload.get("offer") or payload,
+                        }
+                    asyncio.create_task(self._handle_worker_task_offer(payload))
+
+        elif msg_type == "task_offer" and data.get("worker_id"):
+            # Relay-style single offer (not the worker-gateway worker message).
+            asyncio.create_task(
+                self._handle_worker_task_offer(
+                    {
+                        "type": "worker_task_offer",
+                        "worker_id": data.get("worker_id"),
+                        "offer": data.get("offer") or data,
+                    }
+                )
+            )
 
         elif msg_type == "worker_response_ack":
             asyncio.create_task(self._handle_worker_response_ack(data))
@@ -794,7 +834,11 @@ class SubnetCoreClient:
             self._maybe_upstream_error_payload(data)
 
         else:
-            logger.debug(f"Unknown WebSocket message type: {msg_type}")
+            logger.info(
+                "orch-ws inbound: unhandled type=%s keys=%s",
+                msg_type,
+                sorted(k for k in data.keys() if k not in ("signature", "api_key")),
+            )
 
     async def _handle_task_result(self, data: dict[str, Any]) -> None:
         """Process task results off the receive loop so WS request/reply stays live."""

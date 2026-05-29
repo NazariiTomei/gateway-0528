@@ -1368,12 +1368,15 @@ class Orchestrator:
                 f"WS registration config set: url={orch_url}, region={self.settings.region}"
             )
 
+            # Dedicated gateway control must be ready before orch-gateway WS
+            # traffic starts — otherwise worker_task_offer can arrive before
+            # set_worker_gateway_client() and offers are dropped.
+            await self._init_worker_gateway_client()
+
             # Start WebSocket connection for real-time notifications and
             # orchestrator control-plane requests.
             await self.subnet_core_client.start_polling()
             logger.info("SubnetCore WebSocket connection started")
-
-            await self._init_worker_gateway_client()
 
         except Exception as e:
             logger.warning(f"Failed to initialize SubnetCoreClient: {e}")
