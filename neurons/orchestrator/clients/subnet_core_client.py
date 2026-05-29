@@ -197,6 +197,10 @@ class SubnetCoreClient:
         self._transfer_offer_counts: dict[str, int] = {}
         # task_id -> offer_id from worker_task_offer (BeamCore acks may echo task_id as offer_id)
         self._task_offer_ids: dict[str, str] = {}
+        # task_id -> worker_id / transfer_id for ack relay and result persistence
+        self._task_worker_ids: dict[str, str] = {}
+        self._task_transfer_ids: dict[str, str] = {}
+        self._result_relay_inflight: set[str] = set()
 
     def _worker_offer_id(self, task_id: Optional[str], ack_offer_id: Optional[str]) -> str:
         """Resolve offer_id for worker-facing acks when BeamCore echoes task_id instead."""
@@ -919,6 +923,10 @@ class SubnetCoreClient:
         offer_id_for_cache = offer.get("offer_id")
         if task_id_for_cache and offer_id_for_cache:
             self._task_offer_ids[str(task_id_for_cache)] = str(offer_id_for_cache)
+        if task_id_for_cache and worker_id:
+            self._task_worker_ids[str(task_id_for_cache)] = str(worker_id)
+        if task_id_for_cache and transfer_id:
+            self._task_transfer_ids[str(task_id_for_cache)] = str(transfer_id)
 
         logger.info(
             "worker_task_offer: worker=%s task=%s offer=%s transfer=%s chunk=%s",
@@ -997,51 +1005,78 @@ class SubnetCoreClient:
         except Exception as exc:
             logger.error("worker_response_ack forward failed: %s", exc)
 
-    async def _handle_task_result_summary_ack(self, data: dict) -> None:
-        """Forward BeamCore result ack to worker via dedicated gateway."""
+    async def _forward_task_result_summary_ack_to_worker(
+        self,
+        *,
+        worker_id: Optional[str],
+        task_id: Optional[str],
+        offer_id: Optional[str],
+        response: dict,
+    ) -> None:
+        """Forward BeamCore task_result_summary_ack to worker (acks often omit worker_id)."""
         client = self._worker_gateway_client
-        if not client:
+        if not client or not task_id:
             return
 
-        worker_id = data.get("worker_id")
-        task_id = data.get("task_id")
-        beamcore_offer_id = data.get("offer_id")
-        offer_id = self._worker_offer_id(task_id, beamcore_offer_id)
-        received = bool(data.get("received", False))
-        reason = data.get("reason") or data.get("message") or ""
-
-        if not worker_id:
+        wid = (worker_id or self._task_worker_ids.get(str(task_id)) or "").strip()
+        if not wid:
+            logger.warning(
+                "task_result_summary_ack not forwarded: unknown worker for task=%s",
+                (task_id or "")[:16],
+            )
             return
 
-        if beamcore_offer_id and offer_id != beamcore_offer_id:
+        beamcore_offer_id = response.get("offer_id") or offer_id
+        resolved_offer_id = self._worker_offer_id(task_id, beamcore_offer_id)
+        received = bool(response.get("received", False))
+        reason = response.get("reason") or response.get("message") or ""
+
+        if beamcore_offer_id and resolved_offer_id != beamcore_offer_id:
             logger.info(
                 "task_result_summary_ack offer_id remapped for worker: task=%s beamcore=%s worker=%s",
                 (task_id or "")[:16],
                 (str(beamcore_offer_id))[:16],
-                (offer_id or "")[:16],
+                (resolved_offer_id or "")[:16],
+            )
+
+        if not received:
+            logger.warning(
+                "BeamCore rejected task_result_summary: task=%s worker=%s reason=%s",
+                (task_id or "")[:16],
+                wid,
+                reason or "unknown",
             )
 
         logger.info(
             "task_result_summary_ack: worker=%s task=%s offer=%s received=%s reason=%s",
-            worker_id,
+            wid,
             (task_id or "")[:16],
-            (offer_id or "")[:16],
+            (resolved_offer_id or "")[:16],
             received,
             reason or "-",
         )
 
         try:
             await client.send_task_result_summary_ack(
-                worker_id, task_id, offer_id, received, reason=reason
+                wid, task_id, resolved_offer_id, received, reason=reason
             )
             logger.info(
                 "task_result_summary_ack forwarded to worker: worker=%s task=%s received=%s",
-                worker_id,
+                wid,
                 (task_id or "")[:16],
                 received,
             )
         except Exception as exc:
             logger.error("task_result_summary_ack forward failed: %s", exc)
+
+    async def _handle_task_result_summary_ack(self, data: dict) -> None:
+        """Forward BeamCore result ack push to worker via dedicated gateway."""
+        await self._forward_task_result_summary_ack_to_worker(
+            worker_id=data.get("worker_id"),
+            task_id=data.get("task_id"),
+            offer_id=data.get("offer_id"),
+            response=data,
+        )
 
     async def relay_worker_response(self, data: dict) -> dict:
         """Relay worker accept/reject from dedicated gateway to BeamCore."""
@@ -1072,10 +1107,27 @@ class SubnetCoreClient:
 
     async def relay_task_result_summary(self, data: dict) -> dict:
         """Relay worker task completion from dedicated gateway to BeamCore."""
+        task_id = data.get("task_id")
+        worker_id = data.get("worker_id")
+        if task_id and worker_id:
+            self._task_worker_ids[str(task_id)] = str(worker_id)
+
+        if task_id and str(task_id) in self._result_relay_inflight:
+            logger.info(
+                "task_result_summary relay skipped (already in flight): task=%s",
+                (str(task_id))[:16],
+            )
+            return {
+                "type": "task_result_summary_ack",
+                "task_id": task_id,
+                "received": False,
+                "reason": "duplicate_inflight",
+            }
+
         logger.info(
             "relay task_result_summary: worker=%s task=%s offer=%s success=%s bytes=%s mbps=%.1f",
             (data.get("worker_id") or "")[:36],
-            (data.get("task_id") or "")[:16],
+            (task_id or "")[:16],
             (data.get("offer_id") or data.get("task_id") or "")[:16],
             bool(data.get("success", False)),
             int(data.get("bytes_transferred", 0) or 0),
@@ -1083,13 +1135,17 @@ class SubnetCoreClient:
         )
         message = {
             "type": "task_result_summary",
-            "task_id": data.get("task_id"),
+            "task_id": task_id,
             "offer_id": data.get("offer_id") or data.get("task_id"),
-            "worker_id": data.get("worker_id"),
+            "worker_id": worker_id,
             "success": bool(data.get("success", False)),
             "bytes_transferred": int(data.get("bytes_transferred", 0) or 0),
             "bandwidth_mbps": float(data.get("bandwidth_mbps", 0.0) or 0.0),
         }
+        if task_id:
+            transfer_id = self._task_transfer_ids.get(str(task_id))
+            if transfer_id:
+                message["transfer_id"] = transfer_id
         for key in (
             "chunk_hash",
             "error",
@@ -1098,18 +1154,33 @@ class SubnetCoreClient:
             "start_time_us",
             "end_time_us",
             "etag",
+            "transfer_id",
         ):
             if data.get(key) is not None:
                 message[key] = data[key]
-        response = await self._send_ws_request(message, timeout=max(30.0, float(self.timeout)))
-        logger.info(
-            "relay task_result_summary ack from BeamCore: type=%s task=%s received=%s reason=%s",
-            response.get("type"),
-            (response.get("task_id") or data.get("task_id") or "")[:16],
-            response.get("received"),
-            response.get("reason") or response.get("message") or "-",
-        )
-        return response
+        if task_id:
+            self._result_relay_inflight.add(str(task_id))
+        try:
+            response = await self._send_ws_request(
+                message, timeout=max(30.0, float(self.timeout))
+            )
+            logger.info(
+                "relay task_result_summary ack from BeamCore: type=%s task=%s received=%s reason=%s",
+                response.get("type"),
+                (response.get("task_id") or task_id or "")[:16],
+                response.get("received"),
+                response.get("reason") or response.get("message") or "-",
+            )
+            await self._forward_task_result_summary_ack_to_worker(
+                worker_id=worker_id,
+                task_id=task_id,
+                offer_id=data.get("offer_id"),
+                response=response,
+            )
+            return response
+        finally:
+            if task_id:
+                self._result_relay_inflight.discard(str(task_id))
 
     async def _handle_transfer_assigned(self, data: dict) -> None:
         assignment_id = data.get("assignment_id")

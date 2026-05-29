@@ -104,7 +104,7 @@ SEND_TIMEOUT = 30  # seconds
 MAX_RETRIES = 3
 RETRY_BACKOFF = 1.0  # Base backoff in seconds
 FETCH_STREAM_CHUNK_SIZE = 64 * 1024
-WS_TASK_RESULT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_RESULT_ACK_TIMEOUT", "3.0"))
+WS_TASK_RESULT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_RESULT_ACK_TIMEOUT", "15.0"))
 
 
 def _env_bool(name: str, default: bool) -> bool:
