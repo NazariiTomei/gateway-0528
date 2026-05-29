@@ -193,6 +193,8 @@ class SubnetCoreClient:
 
         # Optional orchestrator-owned worker gateway (dedicated pool)
         self._worker_gateway_client: Optional[Any] = None
+        # transfer_id -> count of worker_task_offer seen (for assignment watchdog)
+        self._transfer_offer_counts: dict[str, int] = {}
 
     # =========================================================================
     # Handlers for polling notifications
@@ -897,6 +899,11 @@ class SubnetCoreClient:
         if not worker_id or not offer:
             logger.warning("Malformed worker_task_offer: missing worker_id or offer")
             return
+
+        transfer_id = offer.get("transfer_id") or data.get("transfer_id")
+        if transfer_id:
+            self._transfer_offer_counts[transfer_id] = self._transfer_offer_counts.get(transfer_id, 0) + 1
+
         logger.info(
             "worker_task_offer: worker=%s task=%s offer=%s transfer=%s chunk=%s",
             worker_id,
@@ -908,11 +915,21 @@ class SubnetCoreClient:
 
         try:
             delivered = await client.send_task_offer(worker_id, offer)
-            if not delivered:
-                logger.warning(
-                    "Failed to deliver task offer to worker %s task=%s",
+            if delivered:
+                logger.info(
+                    "task_offer delivered: worker=%s task=%s offer=%s transfer=%s chunk=%s",
                     worker_id,
-                    offer.get("task_id"),
+                    (offer.get("task_id") or "")[:16],
+                    (offer.get("offer_id") or "")[:16],
+                    (offer.get("transfer_id") or "")[:16],
+                    offer.get("chunk_index"),
+                )
+            else:
+                logger.warning(
+                    "task_offer not delivered: worker=%s task=%s offer=%s (worker offline or gateway busy)",
+                    worker_id,
+                    (offer.get("task_id") or "")[:16],
+                    (offer.get("offer_id") or "")[:16],
                 )
         except Exception as exc:
             logger.error("worker_task_offer relay failed: %s", exc)
@@ -932,9 +949,24 @@ class SubnetCoreClient:
         if not worker_id:
             return
 
+        logger.info(
+            "worker_response_ack: worker=%s task=%s offer=%s accepted=%s reason=%s",
+            worker_id,
+            (task_id or "")[:16],
+            (offer_id or "")[:16],
+            accepted,
+            reason or "-",
+        )
+
         try:
             await client.send_task_accept_ack(
                 worker_id, task_id, offer_id, accepted, reason=reason
+            )
+            logger.info(
+                "task_accept_ack forwarded to worker: worker=%s task=%s accepted=%s",
+                worker_id,
+                (task_id or "")[:16],
+                accepted,
             )
         except Exception as exc:
             logger.error("worker_response_ack forward failed: %s", exc)
@@ -954,9 +986,24 @@ class SubnetCoreClient:
         if not worker_id:
             return
 
+        logger.info(
+            "task_result_summary_ack: worker=%s task=%s offer=%s received=%s reason=%s",
+            worker_id,
+            (task_id or "")[:16],
+            (offer_id or "")[:16],
+            received,
+            reason or "-",
+        )
+
         try:
             await client.send_task_result_summary_ack(
                 worker_id, task_id, offer_id, received, reason=reason
+            )
+            logger.info(
+                "task_result_summary_ack forwarded to worker: worker=%s task=%s received=%s",
+                worker_id,
+                (task_id or "")[:16],
+                received,
             )
         except Exception as exc:
             logger.error("task_result_summary_ack forward failed: %s", exc)
@@ -979,7 +1026,14 @@ class SubnetCoreClient:
         }
         if data.get("reason"):
             message["reason"] = data["reason"]
-        return await self._send_ws_request(message, timeout=max(30.0, float(self.timeout)))
+        response = await self._send_ws_request(message, timeout=max(30.0, float(self.timeout)))
+        logger.info(
+            "relay worker_response ack from BeamCore: type=%s task=%s accepted=%s",
+            response.get("type"),
+            (response.get("task_id") or data.get("task_id") or "")[:16],
+            response.get("accepted"),
+        )
+        return response
 
     async def relay_task_result_summary(self, data: dict) -> dict:
         """Relay worker task completion from dedicated gateway to BeamCore."""
@@ -1012,7 +1066,15 @@ class SubnetCoreClient:
         ):
             if data.get(key) is not None:
                 message[key] = data[key]
-        return await self._send_ws_request(message, timeout=max(30.0, float(self.timeout)))
+        response = await self._send_ws_request(message, timeout=max(30.0, float(self.timeout)))
+        logger.info(
+            "relay task_result_summary ack from BeamCore: type=%s task=%s received=%s reason=%s",
+            response.get("type"),
+            (response.get("task_id") or data.get("task_id") or "")[:16],
+            response.get("received"),
+            response.get("reason") or response.get("message") or "-",
+        )
+        return response
 
     async def _handle_transfer_assigned(self, data: dict) -> None:
         assignment_id = data.get("assignment_id")
@@ -1109,6 +1171,8 @@ class SubnetCoreClient:
             # transfers will appear to "expire" with no further logs.
             async def _warn_if_no_offers() -> None:
                 await asyncio.sleep(25)
+                if self._transfer_offer_counts.get(transfer_id, 0) > 0:
+                    return
                 logger.warning(
                     "No worker_task_offer received yet: transfer=%s assignment=%s. "
                     "Likely causes: orch-gateway websocket dropped, BeamCore failed to generate execution_context, "

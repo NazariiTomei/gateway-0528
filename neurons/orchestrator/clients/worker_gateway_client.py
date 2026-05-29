@@ -172,12 +172,27 @@ class WorkerGatewayClient:
                     rec["capacity"] = int(data["capacity"])
 
         elif msg_type == "worker_response":
+            logger.info(
+                "gateway->orch worker_response: worker=%s task=%s offer=%s decision=%s",
+                (data.get("worker_id") or "")[:36],
+                (data.get("task_id") or "")[:16],
+                (data.get("offer_id") or data.get("task_id") or "")[:16],
+                data.get("decision"),
+            )
             if self._on_worker_response:
                 result = self._on_worker_response(data)
                 if asyncio.iscoroutine(result):
                     await result
 
         elif msg_type == "task_result_summary":
+            logger.info(
+                "gateway->orch task_result_summary: worker=%s task=%s offer=%s success=%s bytes=%s",
+                (data.get("worker_id") or "")[:36],
+                (data.get("task_id") or "")[:16],
+                (data.get("offer_id") or data.get("task_id") or "")[:16],
+                bool(data.get("success", False)),
+                int(data.get("bytes_transferred", 0) or 0),
+            )
             if self._on_task_result_summary:
                 result = self._on_task_result_summary(data)
                 if asyncio.iscoroutine(result):
@@ -217,7 +232,22 @@ class WorkerGatewayClient:
             {"type": "task_offer", "worker_id": worker_id, "offer": offer},
             timeout=30.0,
         )
-        return bool(response.get("success"))
+        success = bool(response.get("success"))
+        if success:
+            logger.info(
+                "orch->gateway task_offer ok: worker=%s task=%s offer=%s",
+                worker_id,
+                (offer.get("task_id") or "")[:16],
+                (offer.get("offer_id") or "")[:16],
+            )
+        else:
+            logger.warning(
+                "orch->gateway task_offer failed: worker=%s task=%s reason=%s",
+                worker_id,
+                (offer.get("task_id") or "")[:16],
+                response.get("reason") or "unknown",
+            )
+        return success
 
     async def send_task_accept_ack(
         self,
@@ -238,6 +268,12 @@ class WorkerGatewayClient:
         }
         if reason:
             payload["reason"] = reason
+        logger.info(
+            "orch->gateway task_accept_ack: worker=%s task=%s accepted=%s",
+            worker_id,
+            (task_id or "")[:16],
+            accepted,
+        )
         await self._ws.send(json.dumps(payload))
 
     async def send_task_result_summary_ack(
@@ -259,4 +295,10 @@ class WorkerGatewayClient:
         }
         if reason:
             payload["reason"] = reason
+        logger.info(
+            "orch->gateway task_result_summary_ack: worker=%s task=%s received=%s",
+            worker_id,
+            (task_id or "")[:16],
+            received,
+        )
         await self._ws.send(json.dumps(payload))

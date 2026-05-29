@@ -372,6 +372,20 @@ def create_app(
                         continue
                     payload = {**offer, "type": "task_offer"}
                     delivered = await gateway_state.send_to_worker(worker_id, payload)
+                    if delivered:
+                        logger.info(
+                            "gateway task_offer delivered: worker=%s task=%s offer=%s chunk=%s",
+                            worker_id,
+                            (offer.get("task_id") or "")[:16],
+                            (offer.get("offer_id") or "")[:16],
+                            offer.get("chunk_index"),
+                        )
+                    else:
+                        logger.warning(
+                            "gateway task_offer not delivered: worker=%s task=%s (not connected)",
+                            worker_id,
+                            (offer.get("task_id") or "")[:16],
+                        )
                     await websocket.send_json(
                         {
                             "type": "task_offer_result",
@@ -387,7 +401,14 @@ def create_app(
                 if msg_type in ("task_accept_ack", "task_result_summary_ack"):
                     worker_id = data.get("worker_id")
                     if worker_id:
-                        await gateway_state.send_to_worker(worker_id, data)
+                        sent = await gateway_state.send_to_worker(worker_id, data)
+                        logger.info(
+                            "gateway %s -> worker: worker=%s task=%s sent=%s",
+                            msg_type,
+                            worker_id,
+                            (data.get("task_id") or "")[:16],
+                            sent,
+                        )
                     continue
 
                 if msg_type == "ping":

@@ -1438,6 +1438,10 @@ class Orchestrator:
             return
         try:
             await self.subnet_core_client.relay_worker_response(data)
+            logger.info(
+                "dedicated path: worker_response relay complete task=%s",
+                (data.get("task_id") or "")[:16],
+            )
         except Exception as exc:
             logger.error("Failed to relay worker_response to BeamCore: %s", exc)
 
@@ -1446,6 +1450,11 @@ class Orchestrator:
             return
         try:
             await self.subnet_core_client.relay_task_result_summary(data)
+            logger.info(
+                "dedicated path: task_result_summary relay complete task=%s success=%s",
+                (data.get("task_id") or "")[:16],
+                bool(data.get("success", False)),
+            )
         except Exception as exc:
             logger.error("Failed to relay task_result_summary to BeamCore: %s", exc)
 
