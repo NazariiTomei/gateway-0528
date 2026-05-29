@@ -195,6 +195,17 @@ class SubnetCoreClient:
         self._worker_gateway_client: Optional[Any] = None
         # transfer_id -> count of worker_task_offer seen (for assignment watchdog)
         self._transfer_offer_counts: dict[str, int] = {}
+        # task_id -> offer_id from worker_task_offer (BeamCore acks may echo task_id as offer_id)
+        self._task_offer_ids: dict[str, str] = {}
+
+    def _worker_offer_id(self, task_id: Optional[str], ack_offer_id: Optional[str]) -> str:
+        """Resolve offer_id for worker-facing acks when BeamCore echoes task_id instead."""
+        task_id = (task_id or "").strip()
+        ack = (ack_offer_id or "").strip()
+        cached = self._task_offer_ids.get(task_id, "") if task_id else ""
+        if cached and (not ack or ack == task_id):
+            return cached
+        return ack or cached or task_id
 
     # =========================================================================
     # Handlers for polling notifications
@@ -904,6 +915,11 @@ class SubnetCoreClient:
         if transfer_id:
             self._transfer_offer_counts[transfer_id] = self._transfer_offer_counts.get(transfer_id, 0) + 1
 
+        task_id_for_cache = offer.get("task_id")
+        offer_id_for_cache = offer.get("offer_id")
+        if task_id_for_cache and offer_id_for_cache:
+            self._task_offer_ids[str(task_id_for_cache)] = str(offer_id_for_cache)
+
         logger.info(
             "worker_task_offer: worker=%s task=%s offer=%s transfer=%s chunk=%s",
             worker_id,
@@ -942,12 +958,21 @@ class SubnetCoreClient:
 
         worker_id = data.get("worker_id")
         task_id = data.get("task_id")
-        offer_id = data.get("offer_id") or task_id
+        beamcore_offer_id = data.get("offer_id")
+        offer_id = self._worker_offer_id(task_id, beamcore_offer_id)
         accepted = bool(data.get("accepted", True))
         reason = data.get("reason") or data.get("message") or ""
 
         if not worker_id:
             return
+
+        if beamcore_offer_id and offer_id != beamcore_offer_id:
+            logger.info(
+                "worker_response_ack offer_id remapped for worker: task=%s beamcore=%s worker=%s",
+                (task_id or "")[:16],
+                (str(beamcore_offer_id))[:16],
+                (offer_id or "")[:16],
+            )
 
         logger.info(
             "worker_response_ack: worker=%s task=%s offer=%s accepted=%s reason=%s",
@@ -963,9 +988,10 @@ class SubnetCoreClient:
                 worker_id, task_id, offer_id, accepted, reason=reason
             )
             logger.info(
-                "task_accept_ack forwarded to worker: worker=%s task=%s accepted=%s",
+                "task_accept_ack forwarded to worker: worker=%s task=%s offer=%s accepted=%s",
                 worker_id,
                 (task_id or "")[:16],
+                (offer_id or "")[:16],
                 accepted,
             )
         except Exception as exc:
@@ -979,12 +1005,21 @@ class SubnetCoreClient:
 
         worker_id = data.get("worker_id")
         task_id = data.get("task_id")
-        offer_id = data.get("offer_id") or task_id
+        beamcore_offer_id = data.get("offer_id")
+        offer_id = self._worker_offer_id(task_id, beamcore_offer_id)
         received = bool(data.get("received", False))
         reason = data.get("reason") or data.get("message") or ""
 
         if not worker_id:
             return
+
+        if beamcore_offer_id and offer_id != beamcore_offer_id:
+            logger.info(
+                "task_result_summary_ack offer_id remapped for worker: task=%s beamcore=%s worker=%s",
+                (task_id or "")[:16],
+                (str(beamcore_offer_id))[:16],
+                (offer_id or "")[:16],
+            )
 
         logger.info(
             "task_result_summary_ack: worker=%s task=%s offer=%s received=%s reason=%s",

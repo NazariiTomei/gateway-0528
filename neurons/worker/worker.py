@@ -1426,8 +1426,13 @@ async def websocket_loop(state: WorkerState):
                                 ack_task_id = message.get("task_id")
                                 ack_offer_id = message.get("offer_id") or ack_task_id
                                 server_accepted = message.get("accepted", True)
-                                if ack_offer_id and ack_offer_id in state.pending_task_accepts:
-                                    future = state.pending_task_accepts.pop(ack_offer_id)
+                                accept_key = None
+                                for key in (ack_offer_id, ack_task_id):
+                                    if key and key in state.pending_task_accepts:
+                                        accept_key = key
+                                        break
+                                if accept_key:
+                                    future = state.pending_task_accepts.pop(accept_key)
                                     if not future.done():
                                         future.set_result(server_accepted)
                                 if not server_accepted:
@@ -1441,8 +1446,13 @@ async def websocket_loop(state: WorkerState):
                                 ack_task_id = message.get("task_id")
                                 ack_offer_id = message.get("offer_id") or ack_task_id
                                 received = message.get("received", False)
-                                if ack_offer_id and ack_offer_id in state.pending_task_results:
-                                    future = state.pending_task_results.pop(ack_offer_id)
+                                result_key = None
+                                for key in (ack_offer_id, ack_task_id):
+                                    if key and key in state.pending_task_results:
+                                        result_key = key
+                                        break
+                                if result_key:
+                                    future = state.pending_task_results.pop(result_key)
                                     if not future.done():
                                         future.set_result(bool(received))
                                 if not received:
