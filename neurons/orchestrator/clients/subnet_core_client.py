@@ -1015,76 +1015,38 @@ class SubnetCoreClient:
         except Exception as exc:
             logger.error("worker_response_ack forward failed: %s", exc)
 
-    async def _forward_task_result_summary_ack_to_worker(
+    def _log_beamcore_task_result_summary_ack(
         self,
         *,
         worker_id: Optional[str],
         task_id: Optional[str],
-        offer_id: Optional[str],
         response: dict,
     ) -> None:
-        """Forward BeamCore task_result_summary_ack to worker (acks often omit worker_id)."""
-        client = self._worker_gateway_client
-        if not client or not task_id:
-            return
-
-        wid = (worker_id or self._task_worker_ids.get(str(task_id)) or "").strip()
-        if not wid:
-            logger.warning(
-                "task_result_summary_ack not forwarded: unknown worker for task=%s",
-                (task_id or "")[:16],
-            )
-            return
-
-        beamcore_offer_id = response.get("offer_id") or offer_id
-        resolved_offer_id = self._worker_offer_id(task_id, beamcore_offer_id)
+        """Log BeamCore result ack (Option B: gateway acks worker locally; do not forward)."""
+        wid = (worker_id or self._task_worker_ids.get(str(task_id)) or "").strip() if task_id else ""
         received = bool(response.get("received", False))
         reason = response.get("reason") or response.get("message") or ""
-
-        if beamcore_offer_id and resolved_offer_id != beamcore_offer_id:
-            logger.info(
-                "task_result_summary_ack offer_id remapped for worker: task=%s beamcore=%s worker=%s",
-                (task_id or "")[:16],
-                (str(beamcore_offer_id))[:16],
-                (resolved_offer_id or "")[:16],
-            )
-
         if not received:
             logger.warning(
-                "BeamCore rejected task_result_summary: task=%s worker=%s reason=%s",
+                "BeamCore task_result_summary persist failed: task=%s worker=%s reason=%s "
+                "(worker already acked by gateway; check BeamCore if transfer stays open)",
                 (task_id or "")[:16],
-                wid,
+                wid or "?",
                 reason or "unknown",
             )
-
-        logger.info(
-            "task_result_summary_ack: worker=%s task=%s offer=%s received=%s reason=%s",
-            wid,
-            (task_id or "")[:16],
-            (resolved_offer_id or "")[:16],
-            received,
-            reason or "-",
-        )
-
-        try:
-            await client.send_task_result_summary_ack(
-                wid, task_id, resolved_offer_id, received, reason=reason
-            )
+        else:
             logger.info(
-                "task_result_summary_ack forwarded to worker: worker=%s task=%s received=%s",
-                wid,
+                "BeamCore task_result_summary persisted: task=%s worker=%s completed=%s",
                 (task_id or "")[:16],
-                received,
+                wid or "?",
+                response.get("completed"),
             )
-        except Exception as exc:
-            logger.error("task_result_summary_ack forward failed: %s", exc)
 
     async def _handle_task_result_summary_ack(self, data: dict) -> None:
-        """Forward BeamCore result ack push to worker via dedicated gateway."""
-        await self._forward_task_result_summary_ack_to_worker(
+        """BeamCore result ack push — log only under Option B."""
+        self._log_beamcore_task_result_summary_ack(
             worker_id=data.get("worker_id"),
             task_id=data.get("task_id"),
-            offer_id=data.get("offer_id"),
             response=data,
         )
 
@@ -1181,10 +1143,9 @@ class SubnetCoreClient:
                 "received": prior == "ok",
                 "reason": None if prior == "ok" else prior,
             }
-            await self._forward_task_result_summary_ack_to_worker(
+            self._log_beamcore_task_result_summary_ack(
                 worker_id=worker_id,
                 task_id=task_id,
-                offer_id=data.get("offer_id"),
                 response=response,
             )
             return response
@@ -1233,10 +1194,9 @@ class SubnetCoreClient:
                 response.get("completed"),
                 reason or "-",
             )
-            await self._forward_task_result_summary_ack_to_worker(
+            self._log_beamcore_task_result_summary_ack(
                 worker_id=worker_id,
                 task_id=task_id,
-                offer_id=data.get("offer_id"),
                 response=response,
             )
             return response

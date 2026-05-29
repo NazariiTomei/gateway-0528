@@ -261,6 +261,24 @@ def create_app(
                         int(data.get("bytes_transferred", 0) or 0),
                         float(data.get("bandwidth_mbps", 0.0) or 0.0),
                     )
+                    task_id = data.get("task_id")
+                    offer_id = data.get("offer_id") or task_id
+                    # Option B: ack worker immediately; orch relays to BeamCore in parallel.
+                    await session.websocket.send_json(
+                        {
+                            "type": "task_result_summary_ack",
+                            "task_id": task_id,
+                            "offer_id": offer_id,
+                            "received": True,
+                            "completed": False,
+                        }
+                    )
+                    logger.info(
+                        "gateway task_result_summary_ack -> worker (local): worker=%s task=%s offer=%s",
+                        worker_id,
+                        (task_id or "")[:16],
+                        (offer_id or "")[:16],
+                    )
                     await gateway_state.send_to_control({**data, "worker_id": worker_id})
                     continue
 
@@ -398,7 +416,7 @@ def create_app(
                     )
                     continue
 
-                if msg_type in ("task_accept_ack", "task_result_summary_ack"):
+                if msg_type == "task_accept_ack":
                     worker_id = data.get("worker_id")
                     if worker_id:
                         sent = await gateway_state.send_to_worker(worker_id, data)
@@ -409,6 +427,17 @@ def create_app(
                             (data.get("task_id") or "")[:16],
                             sent,
                         )
+                    continue
+
+                if msg_type == "task_result_summary_ack":
+                    # Option B: worker already got gateway-local ack; BeamCore ack is orch-only.
+                    logger.debug(
+                        "Ignoring orch %s (worker already acked locally): task=%s received=%s reason=%s",
+                        msg_type,
+                        (data.get("task_id") or "")[:16],
+                        data.get("received"),
+                        data.get("reason") or "-",
+                    )
                     continue
 
                 if msg_type == "ping":

@@ -75,8 +75,8 @@ Workers still register via BeamCore HTTP; task offers arrive over **your** WebSo
 - [ ] Gateway `/health` shows `control_connected: true` while orchestrator runs
 - [ ] Worker logs `[WS] Connected!` to your domain
 - [ ] Orchestrator logs `Dedicated worker gateway enabled`
-- [ ] After a task: BeamCore receives `worker_response` then `task_result_summary` (orchestrator relays)
-- [ ] Worker posts payment evidence only after `task_result_summary_ack.received=true`
+- [ ] After a task: gateway acks worker locally; orchestrator relays `task_result_summary` to BeamCore (async)
+- [ ] Worker posts payment evidence to BeamCore HTTP after gateway `task_result_summary_ack`
 
 ## systemd (optional)
 
@@ -107,9 +107,7 @@ WantedBy=multi-user.target
 | **HTTP 502** on `/health` or worker WebSocket | Gateway process not running on port 8001, or Caddy `reverse_proxy` points at the wrong host/port. Run `curl http://127.0.0.1:8001/health` on the Caddy host first. |
 | Worker WebSocket **4401** after connect | Missing `?api_key=` — worker must register with BeamCore first; or set `GATEWAY_REQUIRE_API_KEY=false` only for debugging. |
 | `409 task_not_completed` on payment evidence | Orchestrator not relaying `worker_response` / `task_result_summary` — check control secret and orch logs |
-| `persist_timeout` on `task_result_summary_ack` | BeamCore did not persist the relayed result in time. Restart orch/worker after updating (relay now includes `chunk_index`, `assignment_id`, `bytes_relayed`). If it persists, open a BeamCore ticket with task/transfer IDs — your worker already moved the bytes. |
-| Transfer expires after successful chunk | Same as `persist_timeout` — transfer stays open until BeamCore accepts `task_result_summary` with `received=true` |
-| Worker `Task result ack timeout` | Raise `WORKER_TASK_RESULT_ACK_TIMEOUT` (default 15s) or fix orch forwarding `task_result_summary_ack` to gateway |
+| Result ack flow (Option B) | Gateway acks worker **immediately** on `task_result_summary`; orch relays to BeamCore in parallel. BeamCore persist outcome is orch-log only — worker does not wait for it |
 | `control_connected: false` | `WORKER_GATEWAY_CONTROL_SECRET` mismatch or orchestrator cannot reach control URL |
 | No tasks | `READY=true`, workers connected, orchestrator registered on subnet 105 |
 
