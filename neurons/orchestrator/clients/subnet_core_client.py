@@ -1272,11 +1272,11 @@ class SubnetCoreClient:
                 upstream_gateway_url,
             )
             # Best-effort republish to BeamCore in case of stale routing state.
-            try:
-                await self.update_worker_gateway(expected_gateway_url, max_workers=self._registration_config.get("max_workers", 10000))
-                logger.info("Republished gateway_url via gateway_update: %s", expected_gateway_url)
-            except Exception as exc:
-                logger.warning("gateway_update retry failed: %s", exc)
+            # try:
+            #     await self.update_worker_gateway(expected_gateway_url, max_workers=self._registration_config.get("max_workers", 10000))
+            #     logger.info("Republished gateway_url via gateway_update: %s", expected_gateway_url)
+            # except Exception as exc:
+            #     logger.warning("gateway_update retry failed: %s", exc)
 
         try:
             if not self._ws:

@@ -1420,15 +1420,15 @@ class Orchestrator:
                 control_url,
             )
 
-            if public_url and self.subnet_core_client:
-                try:
-                    await self.subnet_core_client.update_worker_gateway(
-                        gateway_url=public_url,
-                        max_workers=self.settings.max_workers,
-                    )
-                    logger.info("Published worker gateway URL to BeamCore: %s", public_url)
-                except Exception as exc:
-                    logger.warning("gateway_update failed (will retry on reconnect): %s", exc)
+            # if public_url and self.subnet_core_client:
+            #     try:
+            #         await self.subnet_core_client.update_worker_gateway(
+            #             gateway_url=public_url,
+            #             max_workers=self.settings.max_workers,
+            #         )
+            #         logger.info("Published worker gateway URL to BeamCore: %s", public_url)
+            #     except Exception as exc:
+            #         logger.warning("gateway_update failed (will retry on reconnect): %s", exc)
         except Exception as exc:
             logger.error("Failed to initialize dedicated worker gateway client: %s", exc)
             self.worker_gateway_client = None
