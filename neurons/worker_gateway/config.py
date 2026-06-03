@@ -26,8 +26,17 @@ class GatewaySettings(BaseSettings):
     require_worker_api_key: bool = Field(default=True, env="GATEWAY_REQUIRE_API_KEY")
     public_url: Optional[str] = Field(default=None, env="WORKER_GATEWAY_PUBLIC_URL")
 
+    # JSON file for worker stats (total_tasks, bytes_relayed, trust_score, …). Survives restarts.
+    metrics_path: Optional[str] = Field(default=None, env="WORKER_GATEWAY_METRICS_PATH")
+
     def normalized_log_level(self) -> str:
         return self.log_level.upper()
+
+    def resolved_metrics_path(self) -> Path:
+        custom = (self.metrics_path or "").strip()
+        if custom:
+            return Path(custom)
+        return _PACKAGE_DIR / "data" / "worker_metrics.json"
 
 
 @lru_cache

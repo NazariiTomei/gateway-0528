@@ -59,6 +59,7 @@ class WorkerGatewayClient:
 
         self._on_worker_response: Optional[Callable[[dict], Any]] = None
         self._on_task_result_summary: Optional[Callable[[dict], Any]] = None
+        self._on_worker_stats_update: Optional[Callable[[dict], Any]] = None
 
     @property
     def connected(self) -> bool:
@@ -69,6 +70,17 @@ class WorkerGatewayClient:
 
     def set_task_result_summary_handler(self, handler: Callable[[dict], Any]) -> None:
         self._on_task_result_summary = handler
+
+    def set_worker_stats_handler(self, handler: Callable[[dict], Any]) -> None:
+        """Called when gateway pushes worker_stats_update (e.g. after task_result_summary)."""
+        self._on_worker_stats_update = handler
+
+    async def _dispatch_worker_stats(self, row: dict) -> None:
+        if not self._on_worker_stats_update:
+            return
+        result = self._on_worker_stats_update(row)
+        if asyncio.iscoroutine(result):
+            await result
 
     async def start(self) -> None:
         if self._running:
@@ -149,18 +161,37 @@ class WorkerGatewayClient:
         elif msg_type == "worker_connected":
             wid = data.get("worker_id")
             if wid:
-                self._local_workers[wid] = {
-                    "worker_id": wid,
-                    "bandwidth_mbps": float(data.get("bandwidth_mbps", 100.0)),
-                    "trust_score": 0.5,
-                    "capacity": int(data.get("capacity", 4)),
-                }
+                row = data.get("worker")
+                if isinstance(row, dict) and row.get("worker_id"):
+                    self._local_workers[wid] = row
+                else:
+                    self._local_workers[wid] = {
+                        "worker_id": wid,
+                        "region": "unknown",
+                        "status": "active",
+                        "bandwidth_mbps": float(data.get("bandwidth_mbps", 100.0)),
+                        "trust_score": 0.5,
+                        "success_rate": 1.0,
+                        "total_tasks": 0,
+                        "bytes_relayed": 0,
+                        "bytes_relayed_total": 0,
+                        "load_factor": 0.0,
+                        "capacity": int(data.get("capacity", 4)),
+                    }
+                    row = self._local_workers[wid]
+                await self._dispatch_worker_stats(row)
             logger.info("Gateway worker connected: %s", wid)
 
         elif msg_type == "worker_disconnected":
             wid = data.get("worker_id")
             self._local_workers.pop(wid, None)
             logger.info("Gateway worker disconnected: %s", wid)
+
+        elif msg_type == "worker_stats_update":
+            row = data.get("worker")
+            if isinstance(row, dict) and row.get("worker_id"):
+                self._local_workers[row["worker_id"]] = row
+                await self._dispatch_worker_stats(row)
 
         elif msg_type == "worker_capacity_update":
             wid = data.get("worker_id")

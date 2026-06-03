@@ -12,12 +12,13 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Header, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from config import GatewaySettings, get_settings
+from metrics import WorkerMetricsStore
 
 logger = logging.getLogger(__name__)
 
@@ -43,27 +44,22 @@ class ControlSession:
 
 
 class GatewayState:
-    """In-memory session registry for one gateway process."""
+    """Live WebSocket sessions + persisted worker metrics (JSON file)."""
 
-    def __init__(self) -> None:
+    def __init__(self, metrics: WorkerMetricsStore) -> None:
         self.workers: Dict[str, WorkerSession] = {}
         self.control: Optional[ControlSession] = None
+        self.metrics = metrics
 
     def list_worker_records(self) -> List[dict]:
-        now = time.time()
-        records = []
-        for worker_id, session in self.workers.items():
-            records.append(
-                {
-                    "worker_id": worker_id,
-                    "bandwidth_mbps": session.bandwidth_mbps,
-                    "trust_score": session.trust_score,
-                    "capacity": max(0, session.max_concurrent_tasks - session.active_tasks),
-                    "active_tasks": session.active_tasks,
-                    "connected_seconds": int(now - session.connected_at),
-                }
-            )
-        return records
+        """Connected workers with BeamCore-compatible stats (from JSON store + live session)."""
+        return self.metrics.list_connected_records(self.workers)
+
+    async def publish_worker_stats(self, worker_id: str) -> None:
+        if worker_id not in self.workers:
+            return
+        row = self.metrics.get(worker_id).to_beamcore_dict(connected=True)
+        await self.send_to_control({"type": "worker_stats_update", "worker": row})
 
     async def send_to_worker(self, worker_id: str, payload: dict) -> bool:
         session = self.workers.get(worker_id)
@@ -98,7 +94,15 @@ class GatewayState:
             return False
 
 
-gateway_state = GatewayState()
+def _build_gateway_state(settings: GatewaySettings) -> GatewayState:
+    path = settings.resolved_metrics_path()
+    metrics = WorkerMetricsStore(persist_path=path)
+    logger.info(
+        "Worker metrics JSON store: path=%s workers_loaded=%s",
+        path,
+        metrics.worker_count,
+    )
+    return GatewayState(metrics)
 
 
 async def _close_worker_socket(
@@ -128,6 +132,7 @@ def create_app(
     settings = settings or get_settings()
     resolved_secret = (control_secret or settings.control_secret or "").strip()
     app = FastAPI(title="BEAM Worker Gateway", version="0.1.0")
+    gateway_state = _build_gateway_state(settings)
 
     @app.get("/")
     async def root() -> JSONResponse:
@@ -142,10 +147,13 @@ def create_app(
 
     @app.get("/health")
     async def health() -> JSONResponse:
+        metrics_path = gateway_state.metrics.persist_path
         return JSONResponse(
             {
                 "status": "ok",
                 "workers_connected": len(gateway_state.workers),
+                "workers_persisted": gateway_state.metrics.worker_count,
+                "metrics_file": str(metrics_path) if metrics_path else None,
                 "control_connected": gateway_state.control is not None,
                 "public_url": settings.public_url,
                 "require_api_key": settings.require_worker_api_key,
@@ -154,15 +162,12 @@ def create_app(
 
     @app.get("/workers")
     async def workers() -> JSONResponse:
-        """
-        List workers currently connected to this gateway.
-
-        This is an operator/debug endpoint (read-only) and does not include any secrets.
-        """
+        """Connected workers with persisted stats (same shape as BeamCore public pool)."""
         return JSONResponse(
             {
                 "count": len(gateway_state.workers),
                 "workers": gateway_state.list_worker_records(),
+                "metrics_file": str(gateway_state.metrics.persist_path or ""),
             }
         )
 
@@ -171,6 +176,7 @@ def create_app(
         websocket: WebSocket,
         worker_id: str,
         api_key: Optional[str] = Query(default=None),
+        region: Optional[str] = Query(default=None),
     ) -> None:
         # Always accept first — closing before accept causes bad HTTP status / 502 behind Caddy.
         await websocket.accept()
@@ -189,21 +195,34 @@ def create_app(
             old = gateway_state.workers.pop(worker_id)
             await _close_worker_socket(old.websocket, code=4000, reason="replaced")
 
+        record = gateway_state.metrics.touch_connected(worker_id, region=region)
         session = WorkerSession(
             worker_id=worker_id,
             websocket=websocket,
             api_key=api_key or "",
+            bandwidth_mbps=record.bandwidth_mbps,
+            trust_score=record.trust_score,
+            max_concurrent_tasks=record.max_concurrent_tasks,
+            active_tasks=record.active_tasks,
         )
         gateway_state.workers[worker_id] = session
-        logger.info("Worker connected: %s", worker_id)
+        worker_row = record.to_beamcore_dict(connected=True)
+        logger.info(
+            "Worker connected: %s region=%s total_tasks=%s bytes_relayed=%s",
+            worker_id,
+            record.region,
+            record.total_tasks,
+            record.bytes_relayed,
+        )
 
         await websocket.send_json({"type": "connected", "worker_id": worker_id})
         await gateway_state.send_to_control(
             {
                 "type": "worker_connected",
                 "worker_id": worker_id,
-                "capacity": session.max_concurrent_tasks,
-                "bandwidth_mbps": session.bandwidth_mbps,
+                "worker": worker_row,
+                "capacity": worker_row["capacity"],
+                "bandwidth_mbps": worker_row["bandwidth_mbps"],
             }
         )
 
@@ -231,37 +250,68 @@ def create_app(
                             session.active_tasks = int(active)
                         except (TypeError, ValueError):
                             pass
-                    await websocket.send_json({"type": "stats_snapshot_ack"})
-                    await gateway_state.send_to_control(
-                        {
-                            "type": "worker_capacity_update",
-                            "worker_id": worker_id,
-                            "bandwidth_mbps": session.bandwidth_mbps,
-                            "active_tasks": session.active_tasks,
-                        }
+                    bytes_delta = data.get("bytes_relayed_delta")
+                    try:
+                        bytes_delta_int = (
+                            int(bytes_delta) if bytes_delta is not None else None
+                        )
+                    except (TypeError, ValueError):
+                        bytes_delta_int = None
+                    rec = gateway_state.metrics.apply_stats_snapshot(
+                        worker_id,
+                        bandwidth_mbps=session.bandwidth_mbps,
+                        active_tasks=session.active_tasks,
+                        bytes_relayed_delta=bytes_delta_int,
+                        region=data.get("region"),
+                        max_concurrent_tasks=session.max_concurrent_tasks,
                     )
+                    session.trust_score = rec.trust_score
+                    await websocket.send_json({"type": "stats_snapshot_ack"})
+                    await gateway_state.publish_worker_stats(worker_id)
                     continue
 
                 if msg_type == "task_accept":
-                    await _relay_worker_response(session, data, "task_accept")
+                    rec = gateway_state.metrics.on_task_accept(worker_id)
+                    session.active_tasks = rec.active_tasks
+                    await _relay_worker_response(gateway_state, session, data, "task_accept")
+                    await gateway_state.publish_worker_stats(worker_id)
                     continue
 
                 if msg_type == "task_reject":
                     reason = data.get("reason", "")
-                    await _relay_worker_response(session, data, "task_reject", reason=reason)
+                    gateway_state.metrics.on_task_reject(worker_id)
+                    await _relay_worker_response(
+                        gateway_state, session, data, "task_reject", reason=reason
+                    )
+                    await gateway_state.publish_worker_stats(worker_id)
                     continue
 
                 if msg_type == "task_result_summary":
+                    success = bool(data.get("success", False))
+                    bytes_xferred = int(data.get("bytes_transferred", 0) or 0)
+                    bw_result = float(data.get("bandwidth_mbps", 0.0) or 0.0)
+                    rec = gateway_state.metrics.on_task_result(
+                        worker_id,
+                        success=success,
+                        bytes_transferred=bytes_xferred,
+                        bandwidth_mbps=bw_result if bw_result > 0 else None,
+                    )
+                    session.bandwidth_mbps = rec.bandwidth_mbps
+                    session.active_tasks = rec.active_tasks
+                    session.trust_score = rec.trust_score
                     logger.info(
-                        "task_result_summary from worker: worker=%s task=%s offer=%s success=%s bytes=%s mbps=%.1f",
+                        "task_result_summary: worker=%s task=%s success=%s bytes=%s "
+                        "total_tasks=%s bytes_relayed=%s trust=%.3f",
                         worker_id,
                         (data.get("task_id") or "")[:16],
-                        (data.get("offer_id") or data.get("task_id") or "")[:16],
-                        bool(data.get("success", False)),
-                        int(data.get("bytes_transferred", 0) or 0),
-                        float(data.get("bandwidth_mbps", 0.0) or 0.0),
+                        success,
+                        bytes_xferred,
+                        rec.total_tasks,
+                        rec.bytes_relayed,
+                        rec.trust_score,
                     )
                     await gateway_state.send_to_control({**data, "worker_id": worker_id})
+                    await gateway_state.publish_worker_stats(worker_id)
                     continue
 
                 if msg_type == "task_transfer_progress":
@@ -275,13 +325,11 @@ def create_app(
                         )
                     except (TypeError, ValueError):
                         pass
-                    await gateway_state.send_to_control(
-                        {
-                            "type": "worker_capacity_update",
-                            "worker_id": worker_id,
-                            "capacity": session.max_concurrent_tasks,
-                        }
+                    gateway_state.metrics.apply_stats_snapshot(
+                        worker_id,
+                        max_concurrent_tasks=session.max_concurrent_tasks,
                     )
+                    await gateway_state.publish_worker_stats(worker_id)
                     continue
 
                 logger.debug("Worker %s sent unhandled type %s", worker_id, msg_type)
@@ -292,6 +340,7 @@ def create_app(
             logger.exception("Worker session error %s: %s", worker_id, exc)
         finally:
             gateway_state.workers.pop(worker_id, None)
+            gateway_state.metrics.touch_disconnected(worker_id)
             await gateway_state.send_to_control(
                 {"type": "worker_disconnected", "worker_id": worker_id}
             )
@@ -429,6 +478,7 @@ def create_app(
 
 
 async def _relay_worker_response(
+    gateway_state: GatewayState,
     session: WorkerSession,
     data: dict,
     decision: str,

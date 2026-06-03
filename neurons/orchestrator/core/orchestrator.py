@@ -1412,6 +1412,9 @@ class Orchestrator:
             self.worker_gateway_client.set_task_result_summary_handler(
                 self._relay_gateway_task_result_summary
             )
+            self.worker_gateway_client.set_worker_stats_handler(
+                self._on_gateway_worker_stats
+            )
             await self.worker_gateway_client.start()
             self.subnet_core_client.set_worker_gateway_client(self.worker_gateway_client)
             logger.info(
@@ -1444,6 +1447,13 @@ class Orchestrator:
             )
         except Exception as exc:
             logger.error("Failed to relay worker_response to BeamCore: %s", exc)
+
+    async def _on_gateway_worker_stats(self, row: dict) -> None:
+        """Keep orchestrator worker cache in sync with gateway JSON metrics."""
+        try:
+            self._worker_mgr.apply_gateway_worker_row(row)
+        except Exception as exc:
+            logger.warning("Failed to apply gateway worker stats: %s", exc)
 
     async def _relay_gateway_task_result_summary(self, data: dict) -> None:
         if not self.subnet_core_client:

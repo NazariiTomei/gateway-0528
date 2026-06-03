@@ -356,6 +356,46 @@ class WorkerManager:
         logger.info(f"Worker deregistered: {worker_id}")
         return True
 
+    def apply_gateway_worker_row(self, row: dict) -> None:
+        """Apply a full worker row from dedicated gateway (after transfer / stats_snapshot)."""
+        from .orchestrator import Worker, WorkerStatus
+
+        worker_id = (row.get("worker_id") or "").strip()
+        if not worker_id:
+            return
+
+        if worker_id in self.workers:
+            worker = self.workers[worker_id]
+        else:
+            worker = Worker(
+                worker_id=worker_id,
+                hotkey="",
+                ip="0.0.0.0",
+                port=0,
+                region=row.get("region") or "unknown",
+            )
+            self.workers[worker_id] = worker
+
+        worker.last_seen = datetime.utcnow()
+        worker.region = row.get("region") or worker.region
+        if row.get("bandwidth_mbps") is not None:
+            worker.bandwidth_mbps = float(row["bandwidth_mbps"])
+            worker.update_bandwidth_ema(worker.bandwidth_mbps)
+        if row.get("trust_score") is not None:
+            worker.trust_score = float(row["trust_score"])
+        if row.get("success_rate") is not None:
+            worker.success_rate = float(row["success_rate"])
+        if row.get("total_tasks") is not None:
+            worker.total_tasks = int(row["total_tasks"])
+        bytes_total = row.get("bytes_relayed_total", row.get("bytes_relayed"))
+        if bytes_total is not None:
+            worker.bytes_relayed_total = int(bytes_total)
+        if row.get("active_tasks") is not None:
+            worker.active_tasks = int(row["active_tasks"])
+
+        if row.get("status") == "active" or row.get("connected"):
+            worker.status = WorkerStatus.ACTIVE
+
     async def apply_worker_stats_snapshot(
         self,
         worker_id: str,
@@ -554,7 +594,8 @@ class WorkerManager:
                     existing.success_rate = w.get("success_rate", existing.success_rate)
                     existing.total_tasks = w.get("total_tasks", existing.total_tasks)
                     existing.bytes_relayed_total = w.get(
-                        "bytes_relayed_total", existing.bytes_relayed_total
+                        "bytes_relayed_total",
+                        w.get("bytes_relayed", existing.bytes_relayed_total),
                     )
                     existing.global_pending_tasks = w.get(
                         "pending_tasks", 0
@@ -575,7 +616,9 @@ class WorkerManager:
                         trust_score=w.get("trust_score", 0.5),
                         success_rate=w.get("success_rate", 1.0),
                         total_tasks=w.get("total_tasks", 0),
-                        bytes_relayed_total=w.get("bytes_relayed_total", 0),
+                        bytes_relayed_total=w.get(
+                            "bytes_relayed_total", w.get("bytes_relayed", 0)
+                        ),
                         global_pending_tasks=w.get(
                             "pending_tasks", 0
                         ),  # Global task count from BeamCore
