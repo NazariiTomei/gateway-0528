@@ -7,7 +7,7 @@ import logging
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,144 @@ def _running_average_bandwidth(
     return (current_avg * prior_task_count + float(new_sample_mbps)) / (
         prior_task_count + 1
     )
+
+
+def _coerce_float(value: Any, default: float) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def format_worker_stats_row(
+    raw: dict[str, Any],
+    *,
+    worker_id: Optional[str] = None,
+    connected: bool = False,
+) -> dict[str, Any]:
+    """
+    Normalize one worker dict to the BeamCore / public worker-gateway shape.
+
+    Accepts legacy keys (e.g. bytes_relayed only) and fills derived fields.
+    """
+    wid = (worker_id or raw.get("worker_id") or "").strip()
+    if not wid:
+        raise ValueError("worker_id is required")
+
+    total_tasks = _coerce_int(raw.get("total_tasks"), 0)
+    successful_tasks = _coerce_int(
+        raw.get("successful_tasks"),
+        _coerce_int(raw.get("successful_task_count"), 0),
+    )
+    failed_tasks = _coerce_int(raw.get("failed_tasks"), 0)
+    if total_tasks <= 0 and (successful_tasks or failed_tasks):
+        total_tasks = successful_tasks + failed_tasks
+
+    if successful_tasks + failed_tasks > total_tasks:
+        total_tasks = successful_tasks + failed_tasks
+
+    bytes_total = _coerce_int(
+        raw.get("bytes_relayed_total"),
+        _coerce_int(raw.get("bytes_relayed"), 0),
+    )
+    max_concurrent = max(1, _coerce_int(raw.get("max_concurrent_tasks"), 4))
+    active_tasks = max(0, min(_coerce_int(raw.get("active_tasks"), 0), max_concurrent))
+
+    if raw.get("success_rate") is not None:
+        success_rate = round(_coerce_float(raw.get("success_rate"), 1.0), 4)
+    elif total_tasks > 0:
+        success_rate = round(successful_tasks / total_tasks, 4)
+    else:
+        success_rate = 1.0
+
+    load_factor = raw.get("load_factor")
+    if load_factor is not None:
+        load_factor_val = round(min(1.0, max(0.0, _coerce_float(load_factor, 0.0))), 4)
+    else:
+        load_factor_val = round(min(1.0, active_tasks / max_concurrent), 4)
+
+    status = (raw.get("status") or "offline").strip().lower()
+    if connected:
+        status = "active"
+
+    return {
+        "worker_id": wid,
+        "region": (raw.get("region") or "unknown").strip() or "unknown",
+        "status": status,
+        "trust_score": round(
+            min(TRUST_MAX, max(TRUST_MIN, _coerce_float(raw.get("trust_score"), DEFAULT_TRUST))),
+            4,
+        ),
+        "bandwidth_mbps": round(_coerce_float(raw.get("bandwidth_mbps"), 100.0), 2),
+        "success_rate": success_rate,
+        "total_tasks": total_tasks,
+        "successful_tasks": successful_tasks,
+        "failed_tasks": failed_tasks,
+        "bytes_relayed": bytes_total,
+        "bytes_relayed_total": bytes_total,
+        "load_factor": load_factor_val,
+        "active_tasks": active_tasks,
+        "capacity": max(0, max_concurrent - active_tasks),
+        "max_concurrent_tasks": max_concurrent,
+        "connected": connected,
+        "last_seen": _coerce_float(raw.get("last_seen"), time.time()),
+    }
+
+
+def record_from_formatted_row(row: dict[str, Any]) -> WorkerRecord:
+    """Build a WorkerRecord from a formatted worker stats row."""
+    wid = str(row["worker_id"])
+    rec = WorkerRecord(worker_id=wid)
+    rec.region = row.get("region") or "unknown"
+    rec.status = row.get("status") or "offline"
+    rec.trust_score = _coerce_float(row.get("trust_score"), DEFAULT_TRUST)
+    rec.bandwidth_mbps = _coerce_float(row.get("bandwidth_mbps"), 100.0)
+    rec.total_tasks = _coerce_int(row.get("total_tasks"), 0)
+    rec.successful_tasks = _coerce_int(row.get("successful_tasks"), 0)
+    rec.failed_tasks = _coerce_int(row.get("failed_tasks"), 0)
+    rec.success_rate = _coerce_float(row.get("success_rate"), 1.0)
+    rec.bytes_relayed_total = _coerce_int(
+        row.get("bytes_relayed_total"), _coerce_int(row.get("bytes_relayed"), 0)
+    )
+    rec.active_tasks = _coerce_int(row.get("active_tasks"), 0)
+    rec.max_concurrent_tasks = max(1, _coerce_int(row.get("max_concurrent_tasks"), 4))
+    rec.last_seen = _coerce_float(row.get("last_seen"), time.time())
+    rec.recompute_success_rate()
+    return rec
+
+
+def parse_workers_input(payload: Any) -> Dict[str, dict[str, Any]]:
+    """Accept {workers: {...}}, {workers: [...]}, or a bare map/list."""
+    if payload is None:
+        return {}
+
+    if isinstance(payload, list):
+        out: Dict[str, dict[str, Any]] = {}
+        for item in payload:
+            if isinstance(item, dict) and item.get("worker_id"):
+                out[str(item["worker_id"])] = item
+        return out
+
+    if not isinstance(payload, dict):
+        return {}
+
+    workers = payload.get("workers", payload)
+    if isinstance(workers, list):
+        return parse_workers_input(workers)
+    if isinstance(workers, dict):
+        return {str(k): v for k, v in workers.items() if isinstance(v, dict)}
+    return {}
 
 
 @dataclass
@@ -205,6 +343,64 @@ class WorkerMetricsStore:
             rec = self.get(worker_id)
             out.append(rec.to_beamcore_dict(connected=True))
         return out
+
+    def list_all_formatted(
+        self, connected_ids: Optional[Dict[str, Any]] = None
+    ) -> List[dict[str, Any]]:
+        """All persisted workers in BeamCore shape (connected flag when online)."""
+        connected_ids = connected_ids or {}
+        rows: List[dict[str, Any]] = []
+        for worker_id in sorted(self._records.keys()):
+            connected = worker_id in connected_ids
+            rows.append(
+                format_worker_stats_row(
+                    asdict(self._records[worker_id]),
+                    worker_id=worker_id,
+                    connected=connected,
+                )
+            )
+        return rows
+
+    def format_and_cache_initial(
+        self,
+        payload: Optional[Union[dict[str, Any], list[Any]]] = None,
+        *,
+        reload_file: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Normalize worker stats, refresh in-memory cache, and write formatted JSON.
+
+        - With no payload: reload from metrics file (if present), then normalize.
+        - With payload: merge/replace workers from POST body, then normalize.
+        """
+        incoming = parse_workers_input(payload)
+
+        if incoming:
+            # POST import replaces the in-memory cache with the provided workers.
+            self._records.clear()
+            for worker_id, raw in incoming.items():
+                self._records[worker_id] = record_from_formatted_row(
+                    format_worker_stats_row(raw, worker_id=worker_id, connected=False)
+                )
+        elif reload_file:
+            self._records.clear()
+            self._load()
+
+        # Re-normalize every cached row (fixes legacy / inconsistent JSON).
+        normalized: Dict[str, WorkerRecord] = {}
+        for worker_id, rec in self._records.items():
+            row = format_worker_stats_row(asdict(rec), worker_id=worker_id, connected=False)
+            normalized[worker_id] = record_from_formatted_row(row)
+        self._records = normalized
+        self._save()
+
+        formatted_rows = self.list_all_formatted()
+        return {
+            "count": len(formatted_rows),
+            "workers": formatted_rows,
+            "metrics_file": str(self._persist_path) if self._persist_path else None,
+            "updated_at": time.time(),
+        }
 
     def _load(self) -> None:
         if not self._persist_path or not self._persist_path.is_file():

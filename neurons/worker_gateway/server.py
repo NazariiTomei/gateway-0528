@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Header, Query, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Header, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from config import GatewaySettings, get_settings
@@ -97,6 +97,8 @@ class GatewayState:
 def _build_gateway_state(settings: GatewaySettings) -> GatewayState:
     path = settings.resolved_metrics_path()
     metrics = WorkerMetricsStore(persist_path=path)
+    if metrics.worker_count > 0:
+        metrics.format_and_cache_initial(reload_file=False)
     logger.info(
         "Worker metrics JSON store: path=%s workers_loaded=%s",
         path,
@@ -140,6 +142,8 @@ def create_app(
             {
                 "service": "BEAM Worker Gateway",
                 "health": "/health",
+                "workers": "/workers",
+                "format_works": "/format_works",
                 "worker_ws": "/ws/{worker_id}",
                 "control_ws": "/control",
             }
@@ -170,6 +174,60 @@ def create_app(
                 "metrics_file": str(gateway_state.metrics.persist_path or ""),
             }
         )
+
+    def _check_format_works_auth(x_control_secret: Optional[str]) -> Optional[JSONResponse]:
+        if resolved_secret and (x_control_secret or "").strip() != resolved_secret:
+            return JSONResponse(
+                {"error": "invalid or missing x-control-secret"},
+                status_code=403,
+            )
+        return None
+
+    @app.get("/format_works")
+    async def format_works_get(
+        x_control_secret: Optional[str] = Header(default=None, alias="x-control-secret"),
+    ) -> JSONResponse:
+        """
+        Reload worker_metrics.json, normalize all rows, save formatted JSON, refresh cache.
+
+        Use on startup or after hand-editing the metrics file.
+        """
+        auth_err = _check_format_works_auth(x_control_secret)
+        if auth_err:
+            return auth_err
+        result = gateway_state.metrics.format_and_cache_initial(reload_file=True)
+        for worker_id in list(gateway_state.workers.keys()):
+            await gateway_state.publish_worker_stats(worker_id)
+        result["workers_connected"] = len(gateway_state.workers)
+        logger.info(
+            "format_works: normalized %s workers -> %s",
+            result["count"],
+            result.get("metrics_file"),
+        )
+        return JSONResponse(result)
+
+    @app.post("/format_works")
+    async def format_works_post(
+        x_control_secret: Optional[str] = Header(default=None, alias="x-control-secret"),
+        body: Optional[dict] = Body(default=None),
+    ) -> JSONResponse:
+        """
+        Import worker stats from JSON body, normalize, persist, and refresh cache.
+
+        Body: {"workers": {worker_id: {...}}} or {"workers": [{...}, ...]}
+        """
+        auth_err = _check_format_works_auth(x_control_secret)
+        if auth_err:
+            return auth_err
+        result = gateway_state.metrics.format_and_cache_initial(
+            body,
+            reload_file=body is None,
+        )
+        for worker_id in list(gateway_state.workers.keys()):
+            await gateway_state.publish_worker_stats(worker_id)
+        result["workers_connected"] = len(gateway_state.workers)
+        logger.info("format_works POST: cached %s workers", result["count"])
+        return JSONResponse(result)
 
     @app.websocket("/ws/{worker_id}")
     async def worker_ws(
