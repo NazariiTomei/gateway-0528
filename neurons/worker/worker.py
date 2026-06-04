@@ -115,7 +115,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 # Participant workers default to recording a payment obligation unless opted out.
-WORKER_REQUIRED_PAYMENT = _env_bool("WORKER_REQUIRED_PAYMENT", True)
+WORKER_REQUIRED_PAYMENT = _env_bool("WORKER_REQUIRED_PAYMENT", False)
 
 # Global semaphore for task concurrency
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
