@@ -18,6 +18,23 @@ TRUST_MAX = 1.0
 DEFAULT_TRUST = 0.5
 
 
+def _running_average_bandwidth(
+    current_avg: float, prior_task_count: int, new_sample_mbps: float
+) -> float:
+    """
+    Update cumulative average bandwidth after a completed task.
+
+    (avg * prior_task_count + new_sample) / (prior_task_count + 1)
+    """
+    if new_sample_mbps <= 0:
+        return current_avg
+    if prior_task_count <= 0:
+        return float(new_sample_mbps)
+    return (current_avg * prior_task_count + float(new_sample_mbps)) / (
+        prior_task_count + 1
+    )
+
+
 @dataclass
 class WorkerRecord:
     """Aggregated worker stats (survives disconnect; used for list_workers / orch scoring)."""
@@ -31,7 +48,7 @@ class WorkerRecord:
     total_tasks: int = 0
     successful_tasks: int = 0
     failed_tasks: int = 0
-    bytes_relayed: int = 0
+    bytes_relayed_total: int = 0
     active_tasks: int = 0
     max_concurrent_tasks: int = 4
     last_seen: float = field(default_factory=time.time)
@@ -60,8 +77,8 @@ class WorkerRecord:
             "bandwidth_mbps": round(self.bandwidth_mbps, 2),
             "success_rate": self.success_rate,
             "total_tasks": self.total_tasks,
-            "bytes_relayed": self.bytes_relayed,
-            "bytes_relayed_total": self.bytes_relayed,
+            "bytes_relayed": self.bytes_relayed_total,
+            "bytes_relayed_total": self.bytes_relayed_total,
             "load_factor": round(self.load_factor, 4),
             "active_tasks": self.active_tasks,
             "capacity": max(0, self.max_concurrent_tasks - self.active_tasks),
@@ -115,21 +132,16 @@ class WorkerMetricsStore:
         self,
         worker_id: str,
         *,
-        bandwidth_mbps: Optional[float] = None,
         active_tasks: Optional[int] = None,
-        bytes_relayed_delta: Optional[int] = None,
         region: Optional[str] = None,
         max_concurrent_tasks: Optional[int] = None,
     ) -> WorkerRecord:
         rec = self.get(worker_id)
         rec.status = "active"
         rec.last_seen = time.time()
-        if bandwidth_mbps is not None and bandwidth_mbps > 0:
-            rec.bandwidth_mbps = float(bandwidth_mbps)
+        # Live telemetry only — cumulative bytes are updated on task_result_summary.
         if active_tasks is not None:
             rec.active_tasks = max(0, int(active_tasks))
-        if bytes_relayed_delta is not None and bytes_relayed_delta > 0:
-            rec.bytes_relayed += int(bytes_relayed_delta)
         if region and region.strip():
             rec.region = region.strip()
         if max_concurrent_tasks is not None and max_concurrent_tasks > 0:
@@ -163,6 +175,7 @@ class WorkerMetricsStore:
         bandwidth_mbps: Optional[float] = None,
     ) -> WorkerRecord:
         rec = self.get(worker_id)
+        prior_total_tasks = rec.total_tasks
         rec.total_tasks += 1
         if success:
             rec.successful_tasks += 1
@@ -172,9 +185,13 @@ class WorkerMetricsStore:
             rec.trust_score = max(TRUST_MIN, rec.trust_score - TRUST_FAILURE_DELTA)
         rec.recompute_success_rate()
         if bytes_transferred > 0:
-            rec.bytes_relayed += int(bytes_transferred)
+            rec.bytes_relayed_total += int(bytes_transferred)
         if bandwidth_mbps is not None and bandwidth_mbps > 0:
-            rec.bandwidth_mbps = float(bandwidth_mbps)
+            rec.bandwidth_mbps = _running_average_bandwidth(
+                rec.bandwidth_mbps,
+                prior_total_tasks,
+                float(bandwidth_mbps),
+            )
         rec.active_tasks = max(0, rec.active_tasks - 1)
         rec.last_seen = time.time()
         self._save()
@@ -210,7 +227,6 @@ class WorkerMetricsStore:
                     "total_tasks",
                     "successful_tasks",
                     "failed_tasks",
-                    "bytes_relayed",
                     "active_tasks",
                     "max_concurrent_tasks",
                     "last_seen",
@@ -218,6 +234,10 @@ class WorkerMetricsStore:
                 ):
                     if key in data and data[key] is not None:
                         setattr(rec, key, data[key])
+                if data.get("bytes_relayed_total") is not None:
+                    rec.bytes_relayed_total = int(data["bytes_relayed_total"])
+                elif data.get("bytes_relayed") is not None:
+                    rec.bytes_relayed_total = int(data["bytes_relayed"])
                 rec.recompute_success_rate()
                 self._records[str(worker_id)] = rec
             logger.info(

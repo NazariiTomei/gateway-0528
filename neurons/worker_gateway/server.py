@@ -212,7 +212,7 @@ def create_app(
             worker_id,
             record.region,
             record.total_tasks,
-            record.bytes_relayed,
+            record.bytes_relayed_total,
         )
 
         await websocket.send_json({"type": "connected", "worker_id": worker_id})
@@ -250,18 +250,9 @@ def create_app(
                             session.active_tasks = int(active)
                         except (TypeError, ValueError):
                             pass
-                    bytes_delta = data.get("bytes_relayed_delta")
-                    try:
-                        bytes_delta_int = (
-                            int(bytes_delta) if bytes_delta is not None else None
-                        )
-                    except (TypeError, ValueError):
-                        bytes_delta_int = None
                     rec = gateway_state.metrics.apply_stats_snapshot(
                         worker_id,
-                        bandwidth_mbps=session.bandwidth_mbps,
                         active_tasks=session.active_tasks,
-                        bytes_relayed_delta=bytes_delta_int,
                         region=data.get("region"),
                         max_concurrent_tasks=session.max_concurrent_tasks,
                     )
@@ -307,7 +298,7 @@ def create_app(
                         success,
                         bytes_xferred,
                         rec.total_tasks,
-                        rec.bytes_relayed,
+                        rec.bytes_relayed_total,
                         rec.trust_score,
                     )
                     await gateway_state.send_to_control({**data, "worker_id": worker_id})
