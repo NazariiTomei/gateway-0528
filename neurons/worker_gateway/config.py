@@ -22,7 +22,7 @@ class GatewaySettings(BaseSettings):
     port: int = Field(default=8001, env="GATEWAY_PORT")
     log_level: str = Field(default="INFO", env="LOG_LEVEL")
 
-    control_secret: str = Field(default="8jCnUIIfo-MWMvZy3f5ZejjOruJaPlRTtBUsMxe0VZA", env="WORKER_GATEWAY_CONTROL_SECRET")
+    control_secret: str = Field(default="4yCCuAmM-G-YqKXzPeQnL33sRnpxuFZ5cjvSx9JPQ5A", env="WORKER_GATEWAY_CONTROL_SECRET")
     require_worker_api_key: bool = Field(default=True, env="GATEWAY_REQUIRE_API_KEY")
     public_url: Optional[str] = Field(default=None, env="WORKER_GATEWAY_PUBLIC_URL")
 

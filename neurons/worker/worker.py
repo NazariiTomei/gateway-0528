@@ -1677,7 +1677,7 @@ async def main():
 
     api_url = os.environ.get("CORE_SERVER_URL", MAINNET_URL)
     print("Network: mainnet")
-    worker_gateway_url = os.environ.get("WORKER_GATEWAY_URL", "https://gateway.firefoxnode.com")
+    worker_gateway_url = os.environ.get("WORKER_GATEWAY_URL", "https://gw.firefoxnode.com")
 
     print(f"API URL: {api_url}")
     if worker_gateway_url:
