@@ -243,6 +243,31 @@ class WorkerGatewayClient:
         finally:
             self._pending.pop(request_id, None)
 
+    def workers_snapshot(self) -> List[dict]:
+        """Return the latest connected-worker cache without a control-plane round trip."""
+        return list(self._local_workers.values())
+
+    async def push_task_offer(self, worker_id: str, offer: dict) -> bool:
+        """Low-latency dedicated path: push offer without waiting for gateway ack."""
+        if not self._ws or not self._connected:
+            return False
+        if worker_id not in self._local_workers:
+            return False
+        try:
+            await self._ws.send(
+                json.dumps(
+                    {
+                        "type": "task_offer",
+                        "worker_id": worker_id,
+                        "offer": offer,
+                    }
+                )
+            )
+            return True
+        except Exception as exc:
+            logger.warning("push_task_offer failed: worker=%s error=%s", worker_id, exc)
+            return False
+
     async def list_workers(self, timeout: float = 10.0) -> List[dict]:
         if not self.connected:
             return list(self._local_workers.values())
@@ -261,7 +286,7 @@ class WorkerGatewayClient:
     async def send_task_offer(self, worker_id: str, offer: dict) -> bool:
         response = await self._send(
             {"type": "task_offer", "worker_id": worker_id, "offer": offer},
-            timeout=30.0,
+            timeout=10.0,
         )
         success = bool(response.get("success"))
         if success:

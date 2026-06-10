@@ -292,14 +292,14 @@ def create_app(
                     )
                     session.trust_score = rec.trust_score
                     await websocket.send_json({"type": "stats_snapshot_ack"})
-                    await gateway_state.publish_worker_stats(worker_id)
+                    asyncio.create_task(gateway_state.publish_worker_stats(worker_id))
                     continue
 
                 if msg_type == "task_accept":
                     rec = gateway_state.metrics.on_task_accept(worker_id)
                     session.active_tasks = rec.active_tasks
                     await _relay_worker_response(gateway_state, session, data, "task_accept")
-                    await gateway_state.publish_worker_stats(worker_id)
+                    asyncio.create_task(gateway_state.publish_worker_stats(worker_id))
                     continue
 
                 if msg_type == "task_reject":
@@ -308,7 +308,7 @@ def create_app(
                     await _relay_worker_response(
                         gateway_state, session, data, "task_reject", reason=reason
                     )
-                    await gateway_state.publish_worker_stats(worker_id)
+                    asyncio.create_task(gateway_state.publish_worker_stats(worker_id))
                     continue
 
                 if msg_type == "task_result_summary":
@@ -336,7 +336,7 @@ def create_app(
                         rec.trust_score,
                     )
                     await gateway_state.send_to_control({**data, "worker_id": worker_id})
-                    await gateway_state.publish_worker_stats(worker_id)
+                    asyncio.create_task(gateway_state.publish_worker_stats(worker_id))
                     continue
 
                 if msg_type == "task_transfer_progress":
@@ -434,15 +434,17 @@ def create_app(
                 if msg_type == "task_offer":
                     worker_id = data.get("worker_id")
                     offer = data.get("offer") or {}
+                    request_id = data.get("request_id")
                     if not worker_id:
-                        await websocket.send_json(
-                            {
-                                "type": "task_offer_result",
-                                "success": False,
-                                "reason": "missing worker_id",
-                                "request_id": data.get("request_id"),
-                            }
-                        )
+                        if request_id:
+                            await websocket.send_json(
+                                {
+                                    "type": "task_offer_result",
+                                    "success": False,
+                                    "reason": "missing worker_id",
+                                    "request_id": request_id,
+                                }
+                            )
                         continue
                     payload = {**offer, "type": "task_offer"}
                     delivered = await gateway_state.send_to_worker(worker_id, payload)
@@ -460,16 +462,17 @@ def create_app(
                             worker_id,
                             (offer.get("task_id") or "")[:16],
                         )
-                    await websocket.send_json(
-                        {
-                            "type": "task_offer_result",
-                            "success": delivered,
-                            "worker_id": worker_id,
-                            "task_id": offer.get("task_id"),
-                            "offer_id": offer.get("offer_id"),
-                            "request_id": data.get("request_id"),
-                        }
-                    )
+                    if request_id:
+                        await websocket.send_json(
+                            {
+                                "type": "task_offer_result",
+                                "success": delivered,
+                                "worker_id": worker_id,
+                                "task_id": offer.get("task_id"),
+                                "offer_id": offer.get("offer_id"),
+                                "request_id": request_id,
+                            }
+                        )
                     continue
 
                 if msg_type in ("task_accept_ack", "task_result_summary_ack"):

@@ -64,6 +64,56 @@ def _normalize_worker_list(workers: list[dict[str, Any]], transfer_id: str) -> l
     return normalized_workers
 
 
+def _filter_assignable_workers(workers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep connected dedicated workers that still have spare capacity."""
+    assignable: list[dict[str, Any]] = []
+    for worker in workers:
+        worker_id = worker.get("worker_id")
+        if not worker_id:
+            continue
+        load_factor = _coerce_worker_metric(worker.get("load_factor"), 0.0)
+        if load_factor >= 1.0:
+            continue
+        capacity = worker.get("capacity")
+        if capacity is not None:
+            try:
+                if int(capacity) <= 0:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        assignable.append(worker)
+    return assignable
+
+
+def _assign_chunks_by_bandwidth(
+    workers: list[dict[str, Any]],
+    chunk_start: int,
+    chunk_end: int,
+) -> list[dict[str, str | int]]:
+    """
+    Dedicated pool: rank by bandwidth only and spread chunks to the fastest idle workers.
+    """
+    ranked = sorted(
+        workers,
+        key=lambda w: _coerce_worker_metric(w.get("bandwidth_mbps"), 100.0),
+        reverse=True,
+    )
+    pending_load: dict[str, float] = {w["worker_id"]: 0.0 for w in ranked}
+    assignments: list[dict[str, str | int]] = []
+
+    for chunk_index in range(chunk_start, chunk_end + 1):
+
+        def _pick_score(worker: dict[str, Any]) -> float:
+            bandwidth = _coerce_worker_metric(worker.get("bandwidth_mbps"), 100.0)
+            return bandwidth / (1.0 + pending_load[worker["worker_id"]])
+
+        best = max(ranked, key=_pick_score)
+        assignments.append({"chunk_index": chunk_index, "worker_id": best["worker_id"]})
+        pending_load[best["worker_id"]] += 1.0
+
+    return assignments
+
+
 @dataclass
 class TaskExecutionContext:
     """Execution context for real data transfer - passed to workers."""
@@ -948,7 +998,9 @@ class SubnetCoreClient:
         )
 
         try:
-            delivered = await client.send_task_offer(worker_id, offer)
+            delivered = await client.push_task_offer(worker_id, offer)
+            if not delivered:
+                delivered = await client.send_task_offer(worker_id, offer)
             if delivered:
                 logger.info(
                     "task_offer delivered: worker=%s task=%s offer=%s transfer=%s chunk=%s",
@@ -1249,14 +1301,17 @@ class SubnetCoreClient:
         transfer_id = data.get("transfer_id")
         chunk_start = int(data.get("chunk_start", 0))
         chunk_end = int(data.get("chunk_end", 0))
-        request_id = assignment_id or transfer_id
         upstream_gateway_url = (data.get("gateway_url") or "").strip()
 
-        logger.info(f"transfer_assigned: transfer={transfer_id} chunks={chunk_start}-{chunk_end}")
+        logger.info(
+            "transfer_assigned: transfer=%s assignment=%s chunks=%s-%s",
+            transfer_id,
+            assignment_id,
+            chunk_start,
+            chunk_end,
+        )
         if transfer_id and assignment_id:
             self._transfer_assignment_ids[str(transfer_id)] = str(assignment_id)
-        if upstream_gateway_url:
-            logger.info("transfer_assigned gateway_url=%s", upstream_gateway_url)
 
         expected_gateway_url = ""
         try:
@@ -1264,94 +1319,93 @@ class SubnetCoreClient:
         except Exception:
             expected_gateway_url = ""
         expected_gateway_url = expected_gateway_url.strip()
-        if expected_gateway_url and upstream_gateway_url and expected_gateway_url.rstrip("/") != upstream_gateway_url.rstrip("/"):
+        if (
+            expected_gateway_url
+            and upstream_gateway_url
+            and expected_gateway_url.rstrip("/") != upstream_gateway_url.rstrip("/")
+        ):
             logger.warning(
-                "transfer_assigned gateway_url mismatch: expected=%s got=%s. "
-                "BeamCore may still be routing offers via a different gateway; tasks can expire.",
+                "transfer_assigned gateway_url mismatch: expected=%s got=%s",
                 expected_gateway_url,
                 upstream_gateway_url,
             )
-            # Best-effort republish to BeamCore in case of stale routing state.
-            # try:
-            #     await self.update_worker_gateway(expected_gateway_url, max_workers=self._registration_config.get("max_workers", 10000))
-            #     logger.info("Republished gateway_url via gateway_update: %s", expected_gateway_url)
-            # except Exception as exc:
-            #     logger.warning("gateway_update retry failed: %s", exc)
 
         try:
             if not self._ws:
-                logger.error(f"No WS connection for transfer_assigned {transfer_id}")
+                logger.error("No WS connection for transfer_assigned %s", transfer_id)
                 return
 
-            workers: list[dict[str, Any]] = []
-            if not self._worker_gateway_client:
-                # Dedicated-only policy: never fall back to list_public_workers.
+            gateway_client = self._worker_gateway_client
+            if not gateway_client:
                 logger.error(
-                    "Dedicated gateway required but not configured/connected. "
-                    "Refusing transfer_assigned: transfer=%s assignment=%s",
+                    "Dedicated gateway required but not configured: transfer=%s assignment=%s",
                     transfer_id,
                     assignment_id,
                 )
                 return
 
-            try:
-                workers = await self._worker_gateway_client.list_workers(
-                    timeout=max(30.0, float(self.timeout))
-                )
-            except Exception as e:
-                logger.error(
-                    "Failed to list dedicated gateway workers for transfer %s: %s",
-                    transfer_id,
-                    e,
-                )
-                return
+            # Use the live gateway cache first — avoids a control-plane round trip.
+            workers = gateway_client.workers_snapshot()
+            if not workers:
+                try:
+                    workers = await gateway_client.list_workers(timeout=3.0)
+                except Exception as exc:
+                    logger.error(
+                        "Failed to refresh dedicated gateway workers for transfer %s: %s",
+                        transfer_id,
+                        exc,
+                    )
+                    return
 
-            normalized_workers = _normalize_worker_list(workers, transfer_id)
+            normalized_workers = _filter_assignable_workers(
+                _normalize_worker_list(workers, transfer_id)
+            )
             if not normalized_workers:
-                logger.warning(f"No compatible workers available for assignment {assignment_id}")
+                logger.warning(
+                    "No assignable dedicated workers for assignment %s (transfer=%s)",
+                    assignment_id,
+                    transfer_id,
+                )
                 return
 
-            def worker_score(worker: dict[str, Any]) -> float:
-                trust = worker["trust_score"]
-                bandwidth = worker["bandwidth_mbps"]
-                return trust * min(2.0, bandwidth / 100.0)
-
-            sorted_workers = sorted(normalized_workers, key=worker_score, reverse=True)
-            worker_ids = [worker["worker_id"] for worker in sorted_workers]
+            assignments = _assign_chunks_by_bandwidth(
+                normalized_workers,
+                chunk_start,
+                chunk_end,
+            )
+            ranked_preview = sorted(
+                normalized_workers,
+                key=lambda w: _coerce_worker_metric(w.get("bandwidth_mbps"), 100.0),
+                reverse=True,
+            )
             logger.info(
-                "dedicated worker pool (sorted): %s",
-                [wid[:8] for wid in worker_ids],
+                "dedicated worker pool (bandwidth): %s",
+                [
+                    f"{w['worker_id'][:8]}:{_coerce_worker_metric(w.get('bandwidth_mbps'), 100.0):.0f}Mbps"
+                    for w in ranked_preview[:8]
+                ],
+            )
+            logger.info(
+                "chunk_assignments preview: assignment=%s transfer=%s chunks=%s-%s mapping=%s",
+                assignment_id,
+                transfer_id,
+                chunk_start,
+                chunk_end,
+                {a["chunk_index"]: str(a["worker_id"])[:8] for a in assignments[:10]},
             )
 
-            assignments = [
-                {"chunk_index": i, "worker_id": worker_ids[i % len(worker_ids)]}
-                for i in range(chunk_start, chunk_end + 1)
-            ]
-            if assignments:
-                logger.info(
-                    "chunk_assignments preview: assignment=%s transfer=%s chunks=%s-%s mapping=%s",
-                    assignment_id,
-                    transfer_id,
-                    chunk_start,
-                    chunk_end,
-                    {a["chunk_index"]: a["worker_id"][:8] for a in assignments[:10]},
-                )
-
-            # Watchdog: if we never receive worker_task_offer after queueing,
-            # transfers will appear to "expire" with no further logs.
             async def _warn_if_no_offers() -> None:
-                await asyncio.sleep(25)
+                await asyncio.sleep(20)
                 if self._transfer_offer_counts.get(transfer_id, 0) > 0:
                     return
                 logger.warning(
-                    "No worker_task_offer received yet: transfer=%s assignment=%s. "
-                    "Likely causes: orch-gateway websocket dropped, BeamCore failed to generate execution_context, "
-                    "or upstream error. Check for orch-ws error logs and gateway task_offer delivered logs.",
+                    "No worker_task_offer received yet: transfer=%s assignment=%s",
                     transfer_id,
                     assignment_id,
                 )
 
-            max_attempts = 5
+            chunk_timeout = min(15.0, max(8.0, float(self.timeout)))
+            max_attempts = 3
             for attempt in range(1, max_attempts + 1):
                 try:
                     response = await self._send_ws_request(
@@ -1360,7 +1414,7 @@ class SubnetCoreClient:
                             "assignment_id": assignment_id,
                             "assignments": assignments,
                         },
-                        timeout=max(30.0, float(self.timeout)),
+                        timeout=chunk_timeout,
                     )
                     task_count = int(response.get("task_count") or 0)
                     if response.get("type") != "chunks_queued":
@@ -1396,7 +1450,7 @@ class SubnetCoreClient:
                             repr(e),
                         )
                         return
-                    delay = min(30.0, 2.0 * attempt)
+                    delay = min(10.0, 1.0 * attempt)
                     logger.warning(
                         "Failed to queue chunk_assignments for assignment %s "
                         "(attempt %s/%s): %s(%s); retrying in %.1fs",
