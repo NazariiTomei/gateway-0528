@@ -17,6 +17,34 @@ TRUST_MIN = 0.0
 TRUST_MAX = 1.0
 DEFAULT_TRUST = 0.5
 
+# Worker-facing region labels (must match WORKER_REGION on workers).
+VALID_WORKER_REGIONS = frozenset({"europe", "north-america", "asia"})
+
+_REGION_ALIASES: dict[str, str] = {
+    "eu": "europe",
+    "eur": "europe",
+    "europe": "europe",
+    "emea": "europe",
+    "na": "north-america",
+    "us": "north-america",
+    "usa": "north-america",
+    "northamerica": "north-america",
+    "north_america": "north-america",
+    "north-america": "north-america",
+    "americas": "north-america",
+    "apac": "asia",
+    "asia": "asia",
+    "as": "asia",
+}
+
+
+def normalize_worker_region(value: Optional[str]) -> Optional[str]:
+    """Map worker input to one of europe | north-america | asia, or None if invalid."""
+    if not value or not str(value).strip():
+        return None
+    key = str(value).strip().lower().replace(" ", "-")
+    return _REGION_ALIASES.get(key)
+
 
 def _running_average_bandwidth(
     current_avg: float, prior_task_count: int, new_sample_mbps: float
@@ -106,7 +134,9 @@ def format_worker_stats_row(
 
     return {
         "worker_id": wid,
-        "region": (raw.get("region") or "unknown").strip() or "unknown",
+        "region": normalize_worker_region(raw.get("region")) or "unknown",
+        "hotkey": (raw.get("hotkey") or "").strip(),
+        "ip": (raw.get("ip") or "").strip(),
         "status": status,
         "trust_score": round(
             min(TRUST_MAX, max(TRUST_MIN, _coerce_float(raw.get("trust_score"), DEFAULT_TRUST))),
@@ -132,7 +162,9 @@ def record_from_formatted_row(row: dict[str, Any]) -> WorkerRecord:
     """Build a WorkerRecord from a formatted worker stats row."""
     wid = str(row["worker_id"])
     rec = WorkerRecord(worker_id=wid)
-    rec.region = row.get("region") or "unknown"
+    rec.region = normalize_worker_region(row.get("region")) or "unknown"
+    rec.hotkey = (row.get("hotkey") or "").strip()
+    rec.ip = (row.get("ip") or "").strip()
     rec.status = row.get("status") or "offline"
     rec.trust_score = _coerce_float(row.get("trust_score"), DEFAULT_TRUST)
     rec.bandwidth_mbps = _coerce_float(row.get("bandwidth_mbps"), 100.0)
@@ -179,6 +211,8 @@ class WorkerRecord:
 
     worker_id: str
     region: str = "unknown"
+    hotkey: str = ""
+    ip: str = ""
     status: str = "offline"
     trust_score: float = DEFAULT_TRUST
     bandwidth_mbps: float = 100.0
@@ -210,6 +244,8 @@ class WorkerRecord:
         return {
             "worker_id": self.worker_id,
             "region": self.region,
+            "hotkey": self.hotkey,
+            "ip": self.ip,
             "status": status,
             "trust_score": round(self.trust_score, 4),
             "bandwidth_mbps": round(self.bandwidth_mbps, 2),
@@ -248,12 +284,24 @@ class WorkerMetricsStore:
             self._records[worker_id] = WorkerRecord(worker_id=worker_id)
         return self._records[worker_id]
 
-    def touch_connected(self, worker_id: str, *, region: Optional[str] = None) -> WorkerRecord:
+    def touch_connected(
+        self,
+        worker_id: str,
+        *,
+        region: Optional[str] = None,
+        hotkey: Optional[str] = None,
+        ip: Optional[str] = None,
+    ) -> WorkerRecord:
         rec = self.get(worker_id)
         rec.status = "active"
         rec.last_seen = time.time()
-        if region and region.strip():
-            rec.region = region.strip()
+        normalized = normalize_worker_region(region)
+        if normalized:
+            rec.region = normalized
+        if hotkey and hotkey.strip():
+            rec.hotkey = hotkey.strip()
+        if ip and ip.strip():
+            rec.ip = ip.strip()
         self._save()
         return rec
 
@@ -281,7 +329,9 @@ class WorkerMetricsStore:
         if active_tasks is not None:
             rec.active_tasks = max(0, int(active_tasks))
         if region and region.strip():
-            rec.region = region.strip()
+            normalized = normalize_worker_region(region)
+            if normalized:
+                rec.region = normalized
         if max_concurrent_tasks is not None and max_concurrent_tasks > 0:
             rec.max_concurrent_tasks = int(max_concurrent_tasks)
         self._save()
@@ -416,6 +466,8 @@ class WorkerMetricsStore:
                 rec = WorkerRecord(worker_id=str(worker_id))
                 for key in (
                     "region",
+                    "hotkey",
+                    "ip",
                     "status",
                     "trust_score",
                     "bandwidth_mbps",
@@ -430,6 +482,7 @@ class WorkerMetricsStore:
                 ):
                     if key in data and data[key] is not None:
                         setattr(rec, key, data[key])
+                rec.region = normalize_worker_region(rec.region) or rec.region or "unknown"
                 if data.get("bytes_relayed_total") is not None:
                     rec.bytes_relayed_total = int(data["bytes_relayed_total"])
                 elif data.get("bytes_relayed") is not None:

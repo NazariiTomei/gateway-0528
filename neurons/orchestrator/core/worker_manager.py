@@ -378,6 +378,10 @@ class WorkerManager:
 
         worker.last_seen = datetime.utcnow()
         worker.region = row.get("region") or worker.region
+        if row.get("hotkey"):
+            worker.hotkey = str(row["hotkey"]).strip()
+        if row.get("ip"):
+            worker.ip = str(row["ip"]).strip()
         if row.get("bandwidth_mbps") is not None:
             worker.bandwidth_mbps = float(row["bandwidth_mbps"])
             worker.update_bandwidth_ema(worker.bandwidth_mbps)

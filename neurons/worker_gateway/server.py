@@ -18,7 +18,7 @@ from fastapi import Body, FastAPI, Header, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from config import GatewaySettings, get_settings
-from metrics import WorkerMetricsStore
+from metrics import WorkerMetricsStore, VALID_WORKER_REGIONS, normalize_worker_region
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +94,19 @@ class GatewayState:
             return False
 
 
+def _client_ip(websocket: WebSocket) -> str:
+    """Best-effort client IP (supports Caddy/nginx X-Forwarded-For)."""
+    forwarded = websocket.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    real_ip = websocket.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+    if websocket.client and websocket.client.host:
+        return websocket.client.host
+    return ""
+
+
 def _build_gateway_state(settings: GatewaySettings) -> GatewayState:
     path = settings.resolved_metrics_path()
     metrics = WorkerMetricsStore(persist_path=path)
@@ -144,6 +157,7 @@ def create_app(
                 "health": "/health",
                 "workers": "/workers",
                 "format_works": "/format_works",
+                "worker_regions": sorted(VALID_WORKER_REGIONS),
                 "worker_ws": "/ws/{worker_id}",
                 "control_ws": "/control",
             }
@@ -235,9 +249,21 @@ def create_app(
         worker_id: str,
         api_key: Optional[str] = Query(default=None),
         region: Optional[str] = Query(default=None),
+        hotkey: Optional[str] = Query(default=None),
     ) -> None:
         # Always accept first — closing before accept causes bad HTTP status / 502 behind Caddy.
         await websocket.accept()
+
+        client_ip = _client_ip(websocket)
+        worker_hotkey = (hotkey or "").strip()
+        normalized_region = normalize_worker_region(region)
+        if region and not normalized_region:
+            logger.warning(
+                "Worker %s invalid region=%r — use one of %s",
+                worker_id,
+                region,
+                sorted(VALID_WORKER_REGIONS),
+            )
 
         if settings.require_worker_api_key and not (api_key or "").strip():
             logger.warning("Worker %s rejected: missing api_key query param", worker_id)
@@ -253,7 +279,12 @@ def create_app(
             old = gateway_state.workers.pop(worker_id)
             await _close_worker_socket(old.websocket, code=4000, reason="replaced")
 
-        record = gateway_state.metrics.touch_connected(worker_id, region=region)
+        record = gateway_state.metrics.touch_connected(
+            worker_id,
+            region=normalized_region,
+            hotkey=worker_hotkey,
+            ip=client_ip,
+        )
         session = WorkerSession(
             worker_id=worker_id,
             websocket=websocket,
@@ -266,14 +297,23 @@ def create_app(
         gateway_state.workers[worker_id] = session
         worker_row = record.to_beamcore_dict(connected=True)
         logger.info(
-            "Worker connected: %s region=%s total_tasks=%s bytes_relayed=%s",
+            "Worker connected: %s region=%s hotkey=%s ip=%s total_tasks=%s bytes_relayed=%s",
             worker_id,
             record.region,
+            (record.hotkey[:16] + "...") if len(record.hotkey) > 16 else (record.hotkey or "(none)"),
+            record.ip or "(unknown)",
             record.total_tasks,
             record.bytes_relayed_total,
         )
 
-        await websocket.send_json({"type": "connected", "worker_id": worker_id})
+        await websocket.send_json(
+            {
+                "type": "connected",
+                "worker_id": worker_id,
+                "region": record.region,
+                "valid_regions": sorted(VALID_WORKER_REGIONS),
+            }
+        )
         await gateway_state.send_to_control(
             {
                 "type": "worker_connected",

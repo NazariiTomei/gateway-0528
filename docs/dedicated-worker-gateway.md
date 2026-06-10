@@ -6,7 +6,7 @@ Run your own worker gateway at `gateway.firefoxnode.com` (or any host) so worker
 
 | Component | URL |
 | --------- | --- |
-| Worker WebSocket | `wss://gateway.firefoxnode.com/ws/{worker_id}?api_key=...` |
+| Worker WebSocket | `wss://gateway.firefoxnode.com/ws/{worker_id}?api_key=...&hotkey=...&region=europe` |
 | Orchestrator control | `wss://gateway.firefoxnode.com/control` + header `x-control-secret` |
 | Orchestrator ↔ BeamCore | `ORCH_GATEWAY_URL` (unchanged) |
 | Worker payment evidence | `CORE_SERVER_URL` HTTP (unchanged) |
@@ -31,7 +31,10 @@ Health check: `curl https://gateway.firefoxnode.com/health`
 
 ```caddyfile
 gateway.firefoxnode.com {
-    reverse_proxy 127.0.0.1:8001
+    reverse_proxy 127.0.0.1:8001 {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+    }
 }
 ```
 
@@ -65,10 +68,29 @@ Restart the orchestrator. On startup it will:
 export CORE_SERVER_URL=https://beamcore.b1m.ai
 export WORKER_GATEWAY_URL=https://gateway.firefoxnode.com
 
+# Required for dedicated gateway metadata (stored on connect):
+# WORKER_REGION=europe
+# WORKER_REGION=north-america
+# WORKER_REGION=asia
+
 python neurons/worker/worker.py --wallet.name my_wallet --wallet.hotkey my_hotkey
 ```
 
 Workers still register via BeamCore HTTP; task offers arrive over **your** WebSocket.
+
+### Worker metadata on connect
+
+When a worker opens `/ws/{worker_id}`, the gateway stores:
+
+| Field | Source |
+| ----- | ------ |
+| **IP** | `X-Forwarded-For` / `X-Real-IP` (from Caddy) or direct socket |
+| **hotkey** | Query param from worker wallet (`hotkey=...`) |
+| **region** | `WORKER_REGION` env → query param; must normalize to `europe`, `north-america`, or `asia` |
+
+Data is persisted in `worker_metrics.json` and exposed on `GET /workers` (control secret). The orchestrator receives `worker_connected` / `worker_stats_update` rows with these fields.
+
+Invalid or missing region is stored as `unknown` until a valid region is sent on reconnect.
 
 ## Checklist (orch-owned relay)
 
