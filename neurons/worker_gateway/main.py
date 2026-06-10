@@ -67,7 +67,7 @@ def main() -> None:
 ║  Listen:   {settings.host}:{settings.port}
 ║  Workers:  /ws/{{worker_id}}?api_key=...
 ║  Control:  /control  (x-control-secret)
-║  Health:   /health
+║  Workers:  /get-firefox-workers  (x-control-secret)
 ║  Public:   {settings.public_url or "(set WORKER_GATEWAY_PUBLIC_URL)"}
 ╚═══════════════════════════════════════════════════╝
 """

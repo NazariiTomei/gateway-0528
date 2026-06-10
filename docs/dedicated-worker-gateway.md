@@ -8,6 +8,7 @@ Run your own worker gateway at `gateway.firefoxnode.com` (or any host) so worker
 | --------- | --- |
 | Worker WebSocket | `wss://gateway.firefoxnode.com/ws/{worker_id}?api_key=...&hotkey=...&region=europe` |
 | Orchestrator control | `wss://gateway.firefoxnode.com/control` + header `x-control-secret` |
+| Worker list (private) | `GET /get-firefox-workers` + header `x-control-secret` |
 | Orchestrator ↔ BeamCore | `ORCH_GATEWAY_URL` (unchanged) |
 | Worker payment evidence | `CORE_SERVER_URL` HTTP (unchanged) |
 
@@ -25,7 +26,11 @@ cp .env.example .env
 python main.py
 ```
 
-Health check: `curl https://gateway.firefoxnode.com/health`
+List workers (requires secret):
+
+```bash
+curl -s -H "x-control-secret: YOUR_SECRET" https://gateway.firefoxnode.com/get-firefox-workers
+```
 
 ## 2. Caddy (TLS → localhost:8001)
 
@@ -88,13 +93,13 @@ When a worker opens `/ws/{worker_id}`, the gateway stores:
 | **hotkey** | Query param from worker wallet (`hotkey=...`) |
 | **region** | `WORKER_REGION` env → query param; must normalize to `europe`, `north-america`, or `asia` |
 
-Data is persisted in `worker_metrics.json` and exposed on `GET /workers` (control secret). The orchestrator receives `worker_connected` / `worker_stats_update` rows with these fields.
+Data is persisted in `worker_metrics.json` and exposed on `GET /get-firefox-workers` (requires `x-control-secret`). The orchestrator receives `worker_connected` / `worker_stats_update` rows with these fields.
 
 Invalid or missing region is stored as `unknown` until a valid region is sent on reconnect.
 
 ## Checklist (orch-owned relay)
 
-- [ ] Gateway `/health` shows `control_connected: true` while orchestrator runs
+- [ ] `GET /get-firefox-workers` shows `control_connected: true` while orchestrator runs
 - [ ] Worker logs `[WS] Connected!` to your domain
 - [ ] Orchestrator logs `Dedicated worker gateway enabled`
 - [ ] After a task: BeamCore receives `worker_response` then `task_result_summary` (orchestrator relays)
@@ -126,7 +131,7 @@ WantedBy=multi-user.target
 
 | Symptom | Fix |
 | ------- | --- |
-| **HTTP 502** on `/health` or worker WebSocket | Gateway process not running on port 8001, or Caddy `reverse_proxy` points at the wrong host/port. Run `curl http://127.0.0.1:8001/health` on the Caddy host first. |
+| **HTTP 502** on worker WebSocket | Gateway process not running on port 8001, or Caddy `reverse_proxy` points at the wrong host/port. Confirm `python main.py` is running on the Caddy host. |
 | Worker WebSocket **4401** after connect | Missing `?api_key=` — worker must register with BeamCore first; or set `GATEWAY_REQUIRE_API_KEY=false` only for debugging. |
 | `409 task_not_completed` on payment evidence | Orchestrator not relaying `worker_response` / `task_result_summary` — check control secret and orch logs |
 | `persist_timeout` on `task_result_summary_ack` | BeamCore did not persist the relayed result in time. Restart orch/worker after updating (relay now includes `chunk_index`, `assignment_id`, `bytes_relayed`). If it persists, open a BeamCore ticket with task/transfer IDs — your worker already moved the bytes. |
@@ -140,5 +145,5 @@ WantedBy=multi-user.target
 ```bash
 cd neurons/worker_gateway && python main.py
 # In another shell on the same host as Caddy:
-curl -s http://127.0.0.1:8001/health
+curl -s -H "x-control-secret: YOUR_SECRET" http://127.0.0.1:8001/get-firefox-workers
 ```
