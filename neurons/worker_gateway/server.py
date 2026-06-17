@@ -298,42 +298,33 @@ def create_app(
                 if msg_type == "task_accept":
                     rec = gateway_state.metrics.on_task_accept(worker_id)
                     session.active_tasks = rec.active_tasks
-                    await _relay_worker_response(gateway_state, session, data, "task_accept")
+                    await gateway_state.send_to_control({**data, "worker_id": worker_id})
                     asyncio.create_task(gateway_state.publish_worker_stats(worker_id))
                     continue
 
                 if msg_type == "task_reject":
-                    reason = data.get("reason", "")
                     gateway_state.metrics.on_task_reject(worker_id)
-                    await _relay_worker_response(
-                        gateway_state, session, data, "task_reject", reason=reason
-                    )
+                    await gateway_state.send_to_control({**data, "worker_id": worker_id})
                     asyncio.create_task(gateway_state.publish_worker_stats(worker_id))
                     continue
 
-                if msg_type == "task_result_summary":
+                if msg_type == "task_result":
                     success = bool(data.get("success", False))
-                    bytes_xferred = int(data.get("bytes_transferred", 0) or 0)
-                    bw_result = float(data.get("bandwidth_mbps", 0.0) or 0.0)
                     rec = gateway_state.metrics.on_task_result(
                         worker_id,
                         success=success,
-                        bytes_transferred=bytes_xferred,
-                        bandwidth_mbps=bw_result if bw_result > 0 else None,
+                        bytes_transferred=0,
+                        bandwidth_mbps=None,
                     )
                     session.bandwidth_mbps = rec.bandwidth_mbps
                     session.active_tasks = rec.active_tasks
                     session.trust_score = rec.trust_score
                     logger.info(
-                        "task_result_summary: worker=%s task=%s success=%s bytes=%s "
-                        "total_tasks=%s bytes_relayed=%s trust=%.3f",
+                        "task_result: worker=%s task=%s success=%s total_tasks=%s",
                         worker_id,
                         (data.get("task_id") or "")[:16],
                         success,
-                        bytes_xferred,
                         rec.total_tasks,
-                        rec.bytes_relayed_total,
-                        rec.trust_score,
                     )
                     await gateway_state.send_to_control({**data, "worker_id": worker_id})
                     asyncio.create_task(gateway_state.publish_worker_stats(worker_id))
@@ -475,7 +466,7 @@ def create_app(
                         )
                     continue
 
-                if msg_type in ("task_accept_ack", "task_result_summary_ack"):
+                if msg_type in ("task_accept_ack", "task_reject_ack", "task_result_ack"):
                     worker_id = data.get("worker_id")
                     if worker_id:
                         sent = await gateway_state.send_to_worker(worker_id, data)

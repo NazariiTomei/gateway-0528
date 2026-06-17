@@ -64,8 +64,8 @@ Restart the orchestrator. On startup it will:
 
 - Register `gateway_url` with BeamCore
 - Connect to `/control` on your gateway
-- Use **connected workers** for `chunk_assignments` (not `list_public_workers`)
-- Relay `worker_task_offer` → workers and `worker_response` / `task_result_summary` → BeamCore
+- Receive `worker_task_offer_batch` from BeamCore and dispatch offers to connected workers
+- Relay `task_accept`, `task_reject`, and `task_result` between workers and BeamCore
 
 ## 4. Point workers at your gateway
 
@@ -102,7 +102,7 @@ Invalid or missing region is stored as `unknown` until a valid region is sent on
 - [ ] `GET /get-firefox-workers` shows `control_connected: true` while orchestrator runs
 - [ ] Worker logs `[WS] Connected!` to your domain
 - [ ] Orchestrator logs `Dedicated worker gateway enabled`
-- [ ] After a task: BeamCore receives `worker_response` then `task_result_summary` (orchestrator relays)
+- [ ] After a task: worker sends `task_result`, orchestrator relays to BeamCore, worker gets `task_result_ack`
 - [ ] Worker posts payment evidence only after `task_result_summary_ack.received=true`
 
 ## systemd (optional)

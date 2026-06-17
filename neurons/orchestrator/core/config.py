@@ -119,6 +119,7 @@ class OrchestratorSettings(BaseSettings):
     orch_ws_ping_timeout: float = Field(default=45.0, env="ORCH_WS_PING_TIMEOUT")
 
     worker_gateway_public_url: Optional[str] = Field(default=None, env="WORKER_GATEWAY_PUBLIC_URL")
+    worker_gateway_url: Optional[str] = Field(default=None, env="ORCHESTRATOR_WORKER_GATEWAY_URL")
 
     # Dedicated gateway control plane (orchestrator -> /control WebSocket)
     worker_gateway_control_url: Optional[str] = Field(
@@ -266,6 +267,14 @@ class OrchestratorSettings(BaseSettings):
     class Config:
         env_file = ".env"
         extra = "ignore"
+
+    def resolved_worker_gateway_public_url(self) -> Optional[str]:
+        """Beam-advertised worker gateway origin (new or legacy env names)."""
+        return (
+            (self.worker_gateway_url or "").strip()
+            or (self.worker_gateway_public_url or "").strip()
+            or None
+        )
 
     def get_pre_approved_hotkeys(self) -> List[str]:
         """Parse pre-approved client hotkeys from comma-separated string."""

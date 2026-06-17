@@ -44,7 +44,7 @@ import time
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version as package_version
 from typing import Any, Dict, Optional
-from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import httpx
 
@@ -1041,14 +1041,7 @@ async def execute_transfer(
 # =============================================================================
 
 
-def get_ws_url(
-    worker_id: str,
-    api_key: str,
-    gateway_url: str,
-    *,
-    hotkey: Optional[str] = None,
-    region: Optional[str] = None,
-) -> str:
+def get_ws_url(worker_id: str, api_key: str, gateway_url: str) -> str:
     """Convert worker gateway URL to the worker WebSocket URL."""
     base = gateway_url.rstrip("/")
     if base.startswith("https://"):
@@ -1058,15 +1051,8 @@ def get_ws_url(
     else:
         ws_base = "ws://" + base
     url = f"{ws_base}/ws/{worker_id}"
-    params: dict[str, str] = {}
     if api_key:
-        params["api_key"] = api_key
-    if hotkey:
-        params["hotkey"] = hotkey
-    if region:
-        params["region"] = region
-    if params:
-        url = f"{url}?{urlencode(params)}"
+        url = f"{url}?api_key={api_key}"
     return url
 
 
@@ -1352,13 +1338,7 @@ async def websocket_loop(state: WorkerState):
     if not state.worker_gateway_url:
         raise RuntimeError("WORKER_GATEWAY_URL is required for worker gateway transport")
 
-    ws_url = get_ws_url(
-        state.worker_id,
-        state.api_key,
-        state.worker_gateway_url,
-        hotkey=state.wallet.hotkey.ss58_address if state.wallet else None,
-        region=(os.environ.get("WORKER_REGION") or "").strip() or None,
-    )
+    ws_url = get_ws_url(state.worker_id, state.api_key, state.worker_gateway_url)
     print(f"[Worker] Connecting to WebSocket: {ws_url.split('?')[0]}")
     reconnect_delay = WS_RECONNECT_MIN_DELAY
 

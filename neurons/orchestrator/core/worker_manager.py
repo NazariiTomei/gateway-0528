@@ -564,7 +564,8 @@ class WorkerManager:
             # Dedicated-only policy: when a dedicated worker gateway is configured,
             # do NOT sync from BeamCore public worker pool.
             if getattr(subnet_core_client, "uses_dedicated_worker_gateway", lambda: False)():
-                gw_client = getattr(subnet_core_client, "_worker_gateway_client", None)
+                gateway = getattr(subnet_core_client, "_worker_gateway", None)
+                gw_client = getattr(gateway, "_client", None) if gateway else None
                 if not gw_client:
                     logger.warning(
                         "Dedicated gateway enabled but control session not ready; no workers synced"
@@ -572,8 +573,10 @@ class WorkerManager:
                     return 0
                 workers_list = await gw_client.list_workers(timeout=30.0)
             else:
-                workers_data = await subnet_core_client.list_public_workers(status="active")
-                workers_list = workers_data.get("workers", [])
+                logger.warning(
+                    "Public worker gateway removed by BeamCore — configure dedicated worker gateway"
+                )
+                return 0
 
             if not workers_list:
                 logger.info("No workers returned from worker sync source")

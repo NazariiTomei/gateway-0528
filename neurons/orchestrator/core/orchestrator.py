@@ -1336,12 +1336,7 @@ class Orchestrator:
                 self.settings.orch_gateway_url,
             )
 
-            # WS push handlers. Transfer assignments are owned by the client
-            # itself (`_handle_transfer_assigned` -> WS chunk_assignments) per
-            # the BeamCore contract.
-            self.subnet_core_client.set_task_completion_handler(
-                self._handle_task_completion_notification
-            )
+            # BeamCore pushes worker_task_offer_batch; dedicated gateway dispatches locally.
             self.subnet_core_client.set_worker_update_handler(self._worker_mgr.handle_worker_update)
 
             # Configure registration message sent on every WS connect
@@ -1361,16 +1356,14 @@ class Orchestrator:
                 max_workers=self.settings.max_workers,
                 uid=self.our_uid,
                 fee_percentage=self.settings.fee_percentage,
-                gateway_url=self.settings.worker_gateway_public_url,
+                gateway_url=self.settings.resolved_worker_gateway_public_url(),
             )
             self.subnet_core_client.prime_ready_state(bool(self.settings.ready))
             logger.info(
                 f"WS registration config set: url={orch_url}, region={self.settings.region}"
             )
 
-            # Dedicated gateway control must be ready before orch-gateway WS
-            # traffic starts — otherwise worker_task_offer can arrive before
-            # set_worker_gateway_client() and offers are dropped.
+            # Dedicated gateway control must be ready before orch-gateway WS starts.
             await self._init_worker_gateway_client()
 
             # Start WebSocket connection for real-time notifications and
@@ -1386,7 +1379,7 @@ class Orchestrator:
         """Connect orchestrator control plane to a dedicated worker gateway."""
         control_url = self.settings.worker_gateway_control_url
         control_secret = (self.settings.worker_gateway_control_secret or "").strip()
-        public_url = (self.settings.worker_gateway_public_url or "").strip()
+        public_url = (self.settings.resolved_worker_gateway_public_url() or "").strip()
 
         if not control_url or not control_secret:
             if public_url:
@@ -1406,19 +1399,13 @@ class Orchestrator:
                 ping_interval=self.settings.orch_ws_ping_interval,
                 ping_timeout=self.settings.orch_ws_ping_timeout,
             )
-            self.worker_gateway_client.set_worker_response_handler(
-                self._relay_gateway_worker_response
-            )
-            self.worker_gateway_client.set_task_result_summary_handler(
-                self._relay_gateway_task_result_summary
-            )
             self.worker_gateway_client.set_worker_stats_handler(
                 self._on_gateway_worker_stats
             )
             await self.worker_gateway_client.start()
             self.subnet_core_client.set_worker_gateway_client(self.worker_gateway_client)
             logger.info(
-                "Dedicated worker gateway enabled: public=%s control=%s",
+                "Dedicated worker gateway enabled (Beam offer-batch protocol): public=%s control=%s",
                 public_url or "(unset)",
                 control_url,
             )

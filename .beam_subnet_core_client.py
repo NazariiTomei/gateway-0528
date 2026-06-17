@@ -14,7 +14,7 @@ import json
 import logging
 import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 import httpx
 import websockets
@@ -667,9 +667,6 @@ class SubnetCoreClient:
             logger.warning("No local worker gateway available for batch %s", batch_id)
             return
 
-        if hasattr(self._worker_gateway, "reset_batch_load"):
-            self._worker_gateway.reset_batch_load()
-
         delivered = 0
         for offer in offers:
             if not isinstance(offer, dict):
@@ -812,18 +809,9 @@ class SubnetCoreClient:
             return False
 
     def set_worker_gateway(self, gateway) -> None:
-        """Wire worker gateway so task offer batches are dispatched."""
+        """Wire in the in-process WorkerGateway so task offer batches are dispatched."""
         self._worker_gateway = gateway
         gateway.set_upstream(self)
-
-    def set_worker_gateway_client(self, client: Any) -> None:
-        """Backward-compatible alias: wrap external gateway client."""
-        from ..core.dedicated_worker_gateway import DedicatedWorkerGateway
-
-        self.set_worker_gateway(DedicatedWorkerGateway(client))
-
-    def uses_dedicated_worker_gateway(self) -> bool:
-        return self._worker_gateway is not None
 
     async def send_task_accept(
         self,
