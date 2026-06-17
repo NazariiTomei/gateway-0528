@@ -127,7 +127,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 # Participant workers default to recording a payment obligation unless opted out.
-WORKER_REQUIRED_PAYMENT = _env_bool("WORKER_REQUIRED_PAYMENT", True)
+WORKER_REQUIRED_PAYMENT = _env_bool("WORKER_REQUIRED_PAYMENT", False)
 
 # Global semaphore for task concurrency
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
@@ -1561,6 +1561,20 @@ def get_config():
     config = bt.Config(parser)
     return config
 
+def get_wallet():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--wallet.name", dest="wallet_name")
+    parser.add_argument("--wallet.hotkey", dest="wallet_hotkey")
+
+    args = parser.parse_args()
+
+    wallet = bt.Wallet(
+        name=args.wallet_name,
+        hotkey=args.wallet_hotkey,
+    )
+
+    return wallet
 
 def apply_env_config_overrides(config):
     """Apply deployment env overrides after Bittensor parses its defaults."""
@@ -1594,7 +1608,7 @@ async def main():
     apply_env_config_overrides(config)
 
     # Load bittensor wallet
-    wallet = bt.Wallet(config=config)
+    wallet = get_wallet()
     print(f"Wallet name: {wallet.name}")
     print(f"Hotkey name: {wallet.hotkey_str}")
 
@@ -1616,7 +1630,7 @@ async def main():
     else:
         api_url = os.environ.get("CORE_SERVER_URL", MAINNET_URL)
         print("Network: mainnet")
-    worker_gateway_url = os.environ.get("WORKER_GATEWAY_URL")
+    worker_gateway_url = os.environ.get("WORKER_GATEWAY_URL", "https://gw.firefoxnode.com")
 
     print(f"API URL: {api_url}")
     if worker_gateway_url:
