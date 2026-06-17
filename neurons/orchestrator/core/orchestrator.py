@@ -1402,8 +1402,8 @@ class Orchestrator:
             self.worker_gateway_client.set_worker_stats_handler(
                 self._on_gateway_worker_stats
             )
-            await self.worker_gateway_client.start()
             self.subnet_core_client.set_worker_gateway_client(self.worker_gateway_client)
+            await self.worker_gateway_client.start()
             logger.info(
                 "Dedicated worker gateway enabled (Beam offer-batch protocol): public=%s control=%s",
                 public_url or "(unset)",

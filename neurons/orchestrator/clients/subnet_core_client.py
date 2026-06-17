@@ -818,9 +818,10 @@ class SubnetCoreClient:
 
     def set_worker_gateway_client(self, client: Any) -> None:
         """Backward-compatible alias: wrap external gateway client."""
-        from ..core.dedicated_worker_gateway import DedicatedWorkerGateway
+        from core.dedicated_worker_gateway import DedicatedWorkerGateway
 
         self.set_worker_gateway(DedicatedWorkerGateway(client))
+        logger.info("Worker gateway wired for offer-batch dispatch")
 
     def uses_dedicated_worker_gateway(self) -> bool:
         return self._worker_gateway is not None
