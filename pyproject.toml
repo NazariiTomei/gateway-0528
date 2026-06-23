@@ -23,7 +23,8 @@ classifiers = [
 ]
 
 dependencies = [
-    "bittensor>=7.0.0",
+    "bittensor>=10.3.1,<11.0.0",
+    "async-substrate-interface>=2.0.3,<3.0.0",
     "fastapi>=0.104.0",
     "uvicorn>=0.24.0",
     "sqlalchemy>=2.0.0",
