@@ -55,6 +55,8 @@ LOG_LEVEL=INFO
 
 Set `READY=true` only when the orchestrator is ready to accept transfer work.
 
+Each task offer includes executable URLs, headers, `signed_url_flow`, and `minimum_worker_version`. For checksum-bound `signed_url_v1`, object-storage upload offers include signed `dest_headers.Content-MD5`; workers reject offers that omit it.
+
 ## Run
 
 ```bash

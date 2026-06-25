@@ -55,6 +55,12 @@ export CONNECTION_MODE=auto               # or websocket (see worker.py)
 python worker.py --subtensor.network finney
 ```
 
+## Task Offer Protocol
+
+Workers read `WORKER_VERSION` from package metadata. BeamCore includes `minimum_worker_version` in every `task_offer`; workers reject offers below that SemVer with `unsupported_worker_version` before fetching source bytes or uploading destination bytes.
+
+BeamCore also includes `signed_url_flow`. `signed_url_v1` is the default object-storage flow and requires `dest_headers.Content-MD5` on UploadPart offers. Workers reject checksum-less v1 object-storage offers before upload. `signed_url_v2` remains selectable by the transfer creator.
+
 ## How It Works
 
 1. Registers with the network using your Bittensor wallet (signed authentication)
