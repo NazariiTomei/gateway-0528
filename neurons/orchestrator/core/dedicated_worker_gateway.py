@@ -28,7 +28,7 @@ class DedicatedWorkerGateway:
     def __init__(self, client: Any) -> None:
         self._client = client
         self._upstream: Optional[Any] = None
-        self._batch_load: dict[str, float] = {}
+        self._cursor: int = 0
 
     def set_upstream(self, upstream: object) -> None:
         self._upstream = upstream
@@ -43,18 +43,14 @@ class DedicatedWorkerGateway:
         if hasattr(self._client, "stop"):
             await self._client.stop()
 
-    def reset_batch_load(self) -> None:
-        self._batch_load.clear()
-
     def workers_snapshot(self) -> list[dict]:
         if hasattr(self._client, "workers_snapshot"):
             return self._client.workers_snapshot()
         return []
 
-    def _pick_worker_id(self) -> Optional[str]:
-        workers = self.workers_snapshot()
-        assignable: list[dict] = []
-        for worker in workers:
+    def _assignable_worker_ids(self) -> list[str]:
+        assignable: list[str] = []
+        for worker in self.workers_snapshot():
             worker_id = worker.get("worker_id")
             if not worker_id:
                 continue
@@ -67,28 +63,18 @@ class DedicatedWorkerGateway:
                         continue
                 except (TypeError, ValueError):
                     pass
-            assignable.append(worker)
-
-        if not assignable:
-            return None
-
-        def score(worker: dict) -> float:
-            worker_id = worker["worker_id"]
-            bandwidth = _coerce_float(worker.get("bandwidth_mbps"), 100.0)
-            return bandwidth / (1.0 + self._batch_load.get(worker_id, 0.0))
-
-        best = max(assignable, key=score)
-        worker_id = str(best["worker_id"])
-        self._batch_load[worker_id] = self._batch_load.get(worker_id, 0.0) + 1.0
-        return worker_id
+            assignable.append(str(worker_id))
+        return assignable
 
     def get_workers_round_robin(self, n: int = 1) -> list[str]:
-        """Pick highest-bandwidth workers with light load bias (dedicated pool)."""
+        """Rotate through all assignable workers so no single worker is favored."""
+        assignable = self._assignable_worker_ids()
+        if not assignable:
+            return []
         selected: list[str] = []
-        for _ in range(max(0, n)):
-            worker_id = self._pick_worker_id()
-            if not worker_id:
-                break
+        for _ in range(min(max(0, n), len(assignable))):
+            worker_id = assignable[self._cursor % len(assignable)]
+            self._cursor += 1
             selected.append(worker_id)
         return selected
 

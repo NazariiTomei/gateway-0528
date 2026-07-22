@@ -3,15 +3,15 @@
     {
       "name": "beam-worker",
       "script": "worker.py",
-      "interpreter": "./.venv/bin/python",
-      "cwd": "/Workspace/Beam/gateway-0528/neurons/worker",
+      "interpreter": "../venv/bin/python",
+      "cwd": "/workspae/gateway-0528/neurons/worker",
       "env": {
         "PYTHONUNBUFFERED": "1",
         "WALLET_NAME": "beam",
-        "WALLET_HOTKEY": "beam-1",
+        "WALLET_HOTKEY": "orch",
         "WALLET_PATH": "/root/.bittensor/wallets",
         "CORE_SERVER_URL": "https://beamcore.b1m.ai",
-        "WORKER_GATEWAY_URL": "http://103.98.214.121:8000",
+        "WORKER_GATEWAY_URL": "http://157.180.84.151:8000",
         "WORKER_REGION": "europe"
       }
     }

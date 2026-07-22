@@ -917,6 +917,7 @@ class Orchestrator:
         return [
             {
                 "worker_id": w.worker_id,
+                "ip": w.ip,
                 "region": w.region,
                 "status": w.status.value,
                 "trust_score": round(w.trust_score, 4),
