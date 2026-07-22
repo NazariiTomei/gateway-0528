@@ -18,18 +18,18 @@ class GatewaySettings(BaseSettings):
         extra="ignore",
     )
 
-    host: str = Field(default="0.0.0.0", env="GATEWAY_HOST")
-    port: int = Field(default=8001, env="GATEWAY_PORT")
-    log_level: str = Field(default="INFO", env="LOG_LEVEL")
+    host: str = Field(default="0.0.0.0", validation_alias="GATEWAY_HOST")
+    port: int = Field(default=8001, validation_alias="GATEWAY_PORT")
+    log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 
     # No hardcoded default: leaving this unset lets main.py's
     # _resolve_control_secret() generate and print a fresh one at startup.
-    control_secret: str = Field(default="", env="WORKER_GATEWAY_CONTROL_SECRET")
-    require_worker_api_key: bool = Field(default=True, env="GATEWAY_REQUIRE_API_KEY")
-    public_url: Optional[str] = Field(default=None, env="WORKER_GATEWAY_PUBLIC_URL")
+    control_secret: str = Field(default="", validation_alias="WORKER_GATEWAY_CONTROL_SECRET")
+    require_worker_api_key: bool = Field(default=True, validation_alias="GATEWAY_REQUIRE_API_KEY")
+    public_url: Optional[str] = Field(default=None, validation_alias="WORKER_GATEWAY_PUBLIC_URL")
 
     # JSON file for worker stats (total_tasks, bytes_relayed, trust_score, …). Survives restarts.
-    metrics_path: Optional[str] = Field(default=None, env="WORKER_GATEWAY_METRICS_PATH")
+    metrics_path: Optional[str] = Field(default=None, validation_alias="WORKER_GATEWAY_METRICS_PATH")
 
     def normalized_log_level(self) -> str:
         return self.log_level.upper()

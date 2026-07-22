@@ -17,55 +17,55 @@ class OrchestratorSettings(BaseSettings):
     # ==========================================================================
     # API Settings
     # ==========================================================================
-    api_host: str = Field(default="0.0.0.0", env="ORCHESTRATOR_HOST")
-    api_port: int = Field(default=8000, env="API_PORT")  # Also accepts ORCHESTRATOR_PORT
-    log_level: str = Field(default="INFO", env="LOG_LEVEL")
+    api_host: str = Field(default="0.0.0.0", validation_alias="ORCHESTRATOR_HOST")
+    api_port: int = Field(default=8000, validation_alias="API_PORT")  # Also accepts ORCHESTRATOR_PORT
+    log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 
     # Local mode - skip Bittensor wallet/subtensor initialization for development
-    local_mode: bool = Field(default=False, env="LOCAL_MODE")
+    local_mode: bool = Field(default=False, validation_alias="LOCAL_MODE")
     local_orchestrator_hotkey: str = Field(
-        default="local-dev-hotkey", env="LOCAL_ORCHESTRATOR_HOTKEY"
+        default="local-dev-hotkey", validation_alias="LOCAL_ORCHESTRATOR_HOTKEY"
     )
 
     # Add mock worker for testing (use with real wallet but no real miners)
-    add_mock_worker: bool = Field(default=False, env="ADD_MOCK_WORKER")
+    add_mock_worker: bool = Field(default=False, validation_alias="ADD_MOCK_WORKER")
 
     # Mock worker hotkey (use real worker hotkey for realistic PoB records)
-    mock_worker_hotkey: Optional[str] = Field(default=None, env="MOCK_WORKER_HOTKEY")
+    mock_worker_hotkey: Optional[str] = Field(default=None, validation_alias="MOCK_WORKER_HOTKEY")
 
-    region: str = Field(default="US", env="REGION")  # US, EU, APAC, RESERVE (BeamCore registration)
+    region: str = Field(default="US", validation_alias="REGION")  # US, EU, APAC, RESERVE (BeamCore registration)
 
     # ==========================================================================
     # Subnet Settings
     # ==========================================================================
-    netuid: int = Field(default=105, env="NETUID")
-    subtensor_network: str = Field(default="finney", env="SUBTENSOR_NETWORK")
-    subtensor_address: Optional[str] = Field(default=None, env="SUBTENSOR_ADDRESS")
+    netuid: int = Field(default=105, validation_alias="NETUID")
+    subtensor_network: str = Field(default="finney", validation_alias="SUBTENSOR_NETWORK")
+    subtensor_address: Optional[str] = Field(default=None, validation_alias="SUBTENSOR_ADDRESS")
 
     # ==========================================================================
     # Orchestrator Wallet (for signing reports to validators)
     # ==========================================================================
-    wallet_name: str = Field(default="orchestrator", env="WALLET_NAME")
-    wallet_hotkey: str = Field(default="default", env="WALLET_HOTKEY")
-    wallet_path: str = Field(default="~/.bittensor/wallets", env="WALLET_PATH")
+    wallet_name: str = Field(default="orchestrator", validation_alias="WALLET_NAME")
+    wallet_hotkey: str = Field(default="default", validation_alias="WALLET_HOTKEY")
+    wallet_path: str = Field(default="~/.bittensor/wallets", validation_alias="WALLET_PATH")
 
     # ==========================================================================
     # Orchestrator UID (on-chain miner slot)
     # ==========================================================================
     # If set, uses this UID for registration. Otherwise auto-detects from metagraph.
     # Get your UID: btcli subnet metagraph --netuid 105 --subtensor.network finney
-    uid: Optional[int] = Field(default=None, env="ORCHESTRATOR_UID")
+    uid: Optional[int] = Field(default=None, validation_alias="ORCHESTRATOR_UID")
 
     # ==========================================================================
     # Fee Settings (% of emission shared with workers)
     # ==========================================================================
-    fee_percentage: float = Field(default=0.0, env="FEE_PERCENTAGE")  # 0-100%
+    fee_percentage: float = Field(default=0.0, validation_alias="FEE_PERCENTAGE")  # 0-100%
 
     # ==========================================================================
     # Compensation reference settings
     # ==========================================================================
     # Reference per-chunk amount for local accounting and operator-defined compensation workflows.
-    alpha_per_chunk: float = Field(default=0.5, env="ALPHA_PER_CHUNK")
+    alpha_per_chunk: float = Field(default=0.5, validation_alias="ALPHA_PER_CHUNK")
 
     # ==========================================================================
     # Readiness
@@ -73,124 +73,124 @@ class OrchestratorSettings(BaseSettings):
     # When True, orchestrator signals BeamCore that it is ready to receive transfers.
     # Set via READY=true env var or the NATS control set_ready flow at runtime.
     # Default is False — new orchestrators are excluded from routing until explicit opt-in.
-    ready: bool = Field(default=False, env="READY")
+    ready: bool = Field(default=False, validation_alias="READY")
 
     # ==========================================================================
     # Worker Management
     # ==========================================================================
-    max_workers: int = Field(default=10000, env="MAX_WORKERS")
-    worker_timeout_seconds: int = Field(default=300, env="WORKER_TIMEOUT")
-    min_worker_bandwidth_mbps: float = Field(default=10.0, env="MIN_WORKER_BANDWIDTH")
-    worker_heartbeat_interval: int = Field(default=30, env="WORKER_HEARTBEAT_INTERVAL")
+    max_workers: int = Field(default=10000, validation_alias="MAX_WORKERS")
+    worker_timeout_seconds: int = Field(default=300, validation_alias="WORKER_TIMEOUT")
+    min_worker_bandwidth_mbps: float = Field(default=10.0, validation_alias="MIN_WORKER_BANDWIDTH")
+    worker_heartbeat_interval: int = Field(default=30, validation_alias="WORKER_HEARTBEAT_INTERVAL")
 
     # ==========================================================================
     # Task Settings
     # ==========================================================================
-    max_concurrent_tasks: int = Field(default=1000, env="MAX_CONCURRENT_TASKS")
-    task_timeout_seconds: int = Field(default=120, env="TASK_TIMEOUT")
-    chunk_size_bytes: int = Field(default=1024 * 1024, env="CHUNK_SIZE")  # 1 MB
+    max_concurrent_tasks: int = Field(default=1000, validation_alias="MAX_CONCURRENT_TASKS")
+    task_timeout_seconds: int = Field(default=120, validation_alias="TASK_TIMEOUT")
+    chunk_size_bytes: int = Field(default=1024 * 1024, validation_alias="CHUNK_SIZE")  # 1 MB
 
     # ==========================================================================
     # Anti-Fraud Settings
     # ==========================================================================
-    enable_geo_verification: bool = Field(default=True, env="ENABLE_GEO_VERIFICATION")
-    enable_latency_verification: bool = Field(default=True, env="ENABLE_LATENCY_VERIFICATION")
-    max_suspicious_score: float = Field(default=0.3, env="MAX_SUSPICIOUS_SCORE")
+    enable_geo_verification: bool = Field(default=True, validation_alias="ENABLE_GEO_VERIFICATION")
+    enable_latency_verification: bool = Field(default=True, validation_alias="ENABLE_LATENCY_VERIFICATION")
+    max_suspicious_score: float = Field(default=0.3, validation_alias="MAX_SUSPICIOUS_SCORE")
 
     # ==========================================================================
     # BeamCore API (for internal data storage)
     # ==========================================================================
-    core_server_url: str = Field(default="https://beamcore.b1m.ai", env="CORE_SERVER_URL")
+    core_server_url: str = Field(default="https://beamcore.b1m.ai", validation_alias="CORE_SERVER_URL")
 
-    orch_gateway_url: Optional[str] = Field(default=None, env="ORCH_GATEWAY_URL")
+    orch_gateway_url: Optional[str] = Field(default=None, validation_alias="ORCH_GATEWAY_URL")
 
     # Dedicated worker gateway control WebSocket transport (high-latency / WSL /
     # cross-region: increase these). Unrelated to the NATS orch_gateway_url session.
-    orch_ws_open_timeout: float = Field(default=60.0, env="ORCH_WS_OPEN_TIMEOUT")
-    orch_ws_close_timeout: float = Field(default=20.0, env="ORCH_WS_CLOSE_TIMEOUT")
-    orch_ws_ping_interval: float = Field(default=30.0, env="ORCH_WS_PING_INTERVAL")
-    orch_ws_ping_timeout: float = Field(default=45.0, env="ORCH_WS_PING_TIMEOUT")
+    orch_ws_open_timeout: float = Field(default=60.0, validation_alias="ORCH_WS_OPEN_TIMEOUT")
+    orch_ws_close_timeout: float = Field(default=20.0, validation_alias="ORCH_WS_CLOSE_TIMEOUT")
+    orch_ws_ping_interval: float = Field(default=30.0, validation_alias="ORCH_WS_PING_INTERVAL")
+    orch_ws_ping_timeout: float = Field(default=45.0, validation_alias="ORCH_WS_PING_TIMEOUT")
 
-    worker_gateway_public_url: Optional[str] = Field(default=None, env="WORKER_GATEWAY_PUBLIC_URL")
-    worker_gateway_url: Optional[str] = Field(default=None, env="ORCHESTRATOR_WORKER_GATEWAY_URL")
+    worker_gateway_public_url: Optional[str] = Field(default=None, validation_alias="WORKER_GATEWAY_PUBLIC_URL")
+    worker_gateway_url: Optional[str] = Field(default=None, validation_alias="ORCHESTRATOR_WORKER_GATEWAY_URL")
 
     # Dedicated gateway control plane (orchestrator -> /control WebSocket)
     worker_gateway_control_url: Optional[str] = Field(
-        default=None, env="WORKER_GATEWAY_CONTROL_URL"
+        default=None, validation_alias="WORKER_GATEWAY_CONTROL_URL"
     )
     worker_gateway_control_secret: Optional[str] = Field(
-        default=None, env="WORKER_GATEWAY_CONTROL_SECRET"
+        default=None, validation_alias="WORKER_GATEWAY_CONTROL_SECRET"
     )
 
     # ==========================================================================
     # Worker Scoring Weights (for selection)
     # ==========================================================================
-    weight_trust: float = Field(default=0.30, env="WEIGHT_TRUST")
-    weight_latency: float = Field(default=0.25, env="WEIGHT_LATENCY")
-    weight_load: float = Field(default=0.20, env="WEIGHT_LOAD")
-    weight_bandwidth: float = Field(default=0.15, env="WEIGHT_BANDWIDTH")
-    weight_success: float = Field(default=0.10, env="WEIGHT_SUCCESS")
+    weight_trust: float = Field(default=0.30, validation_alias="WEIGHT_TRUST")
+    weight_latency: float = Field(default=0.25, validation_alias="WEIGHT_LATENCY")
+    weight_load: float = Field(default=0.20, validation_alias="WEIGHT_LOAD")
+    weight_bandwidth: float = Field(default=0.15, validation_alias="WEIGHT_BANDWIDTH")
+    weight_success: float = Field(default=0.10, validation_alias="WEIGHT_SUCCESS")
 
     # ==========================================================================
     # Reward Distribution Weights (for epoch-end payment calculation)
     # ==========================================================================
     # Primary factor: bytes relayed (work done)
-    reward_weight_bytes: float = Field(default=0.50, env="REWARD_WEIGHT_BYTES")
+    reward_weight_bytes: float = Field(default=0.50, validation_alias="REWARD_WEIGHT_BYTES")
     # Quality factors
-    reward_weight_success_rate: float = Field(default=0.20, env="REWARD_WEIGHT_SUCCESS_RATE")
-    reward_weight_latency: float = Field(default=0.15, env="REWARD_WEIGHT_LATENCY")
-    reward_weight_trust: float = Field(default=0.15, env="REWARD_WEIGHT_TRUST")
+    reward_weight_success_rate: float = Field(default=0.20, validation_alias="REWARD_WEIGHT_SUCCESS_RATE")
+    reward_weight_latency: float = Field(default=0.15, validation_alias="REWARD_WEIGHT_LATENCY")
+    reward_weight_trust: float = Field(default=0.15, validation_alias="REWARD_WEIGHT_TRUST")
 
     # ==========================================================================
     # BEAM Storage Settings (Hub)
     # ==========================================================================
     storage_gateway_url: str = Field(
-        default="https://storage.beam.network", env="STORAGE_GATEWAY_URL"
+        default="https://storage.beam.network", validation_alias="STORAGE_GATEWAY_URL"
     )
-    storage_replication_factor: int = Field(default=3, env="STORAGE_REPLICATION_FACTOR")
+    storage_replication_factor: int = Field(default=3, validation_alias="STORAGE_REPLICATION_FACTOR")
 
     # External IP for registration (auto-detected if not set)
-    external_ip: Optional[str] = Field(default=None, env="EXTERNAL_IP")
+    external_ip: Optional[str] = Field(default=None, validation_alias="EXTERNAL_IP")
 
     # ==========================================================================
     # Client Authentication
     # ==========================================================================
     # Master toggle for client authentication
-    client_auth_enabled: bool = Field(default=True, env="CLIENT_AUTH_ENABLED")
+    client_auth_enabled: bool = Field(default=True, validation_alias="CLIENT_AUTH_ENABLED")
 
     # If true, only whitelisted clients can register
-    client_whitelist_only: bool = Field(default=False, env="CLIENT_WHITELIST_ONLY")
+    client_whitelist_only: bool = Field(default=False, validation_alias="CLIENT_WHITELIST_ONLY")
 
     # Pre-approved hotkeys (comma-separated SS58 addresses)
     client_pre_approved_hotkeys: Optional[str] = Field(
-        default=None, env="CLIENT_PRE_APPROVED_HOTKEYS"
+        default=None, validation_alias="CLIENT_PRE_APPROVED_HOTKEYS"
     )
 
     # Admin hotkeys for client management (comma-separated SS58 addresses)
-    client_admin_hotkeys: Optional[str] = Field(default=None, env="CLIENT_ADMIN_HOTKEYS")
+    client_admin_hotkeys: Optional[str] = Field(default=None, validation_alias="CLIENT_ADMIN_HOTKEYS")
 
     # Signature expiration time (seconds)
     client_signature_max_age_seconds: int = Field(
-        default=300, env="CLIENT_SIGNATURE_MAX_AGE_SECONDS"
+        default=300, validation_alias="CLIENT_SIGNATURE_MAX_AGE_SECONDS"
     )
 
     # ==========================================================================
     # Subnet Participant Authentication (Validators & Workers)
     # ==========================================================================
     # Master toggle for subnet participant auth (validators and workers)
-    subnet_auth_enabled: bool = Field(default=True, env="SUBNET_AUTH_ENABLED")
+    subnet_auth_enabled: bool = Field(default=True, validation_alias="SUBNET_AUTH_ENABLED")
 
     # Require metagraph verification (hotkey must be registered on subnet)
-    subnet_auth_require_metagraph: bool = Field(default=True, env="SUBNET_AUTH_REQUIRE_METAGRAPH")
+    subnet_auth_require_metagraph: bool = Field(default=True, validation_alias="SUBNET_AUTH_REQUIRE_METAGRAPH")
 
     # Whitelisted hotkeys that bypass metagraph check (comma-separated)
-    subnet_auth_whitelist: Optional[str] = Field(default=None, env="SUBNET_AUTH_WHITELIST")
+    subnet_auth_whitelist: Optional[str] = Field(default=None, validation_alias="SUBNET_AUTH_WHITELIST")
 
     # ==========================================================================
     # Subnet Partner Program (free access for other Bittensor subnets)
     # ==========================================================================
     # Enable subnet partner registration (hotkeys from other subnets get free access)
-    subnet_partner_enabled: bool = Field(default=True, env="SUBNET_PARTNER_ENABLED")
+    subnet_partner_enabled: bool = Field(default=True, validation_alias="SUBNET_PARTNER_ENABLED")
 
     def model_post_init(self, __context) -> None:
         object.__setattr__(self, "log_level", self.log_level.upper())
@@ -206,57 +206,57 @@ class OrchestratorSettings(BaseSettings):
     # Client Tiers
     # ==========================================================================
     # Basic tier
-    client_tier_basic_rpm: int = Field(default=30, env="CLIENT_TIER_BASIC_RPM")
+    client_tier_basic_rpm: int = Field(default=30, validation_alias="CLIENT_TIER_BASIC_RPM")
     client_tier_basic_daily_bytes: int = Field(
-        default=1_073_741_824, env="CLIENT_TIER_BASIC_DAILY_BYTES"
+        default=1_073_741_824, validation_alias="CLIENT_TIER_BASIC_DAILY_BYTES"
     )  # 1GB
-    client_tier_basic_concurrent: int = Field(default=2, env="CLIENT_TIER_BASIC_CONCURRENT")
+    client_tier_basic_concurrent: int = Field(default=2, validation_alias="CLIENT_TIER_BASIC_CONCURRENT")
 
     # Standard tier
-    client_tier_standard_rpm: int = Field(default=120, env="CLIENT_TIER_STANDARD_RPM")
+    client_tier_standard_rpm: int = Field(default=120, validation_alias="CLIENT_TIER_STANDARD_RPM")
     client_tier_standard_daily_bytes: int = Field(
-        default=10_737_418_240, env="CLIENT_TIER_STANDARD_DAILY_BYTES"
+        default=10_737_418_240, validation_alias="CLIENT_TIER_STANDARD_DAILY_BYTES"
     )  # 10GB
-    client_tier_standard_concurrent: int = Field(default=10, env="CLIENT_TIER_STANDARD_CONCURRENT")
+    client_tier_standard_concurrent: int = Field(default=10, validation_alias="CLIENT_TIER_STANDARD_CONCURRENT")
 
     # Premium tier
-    client_tier_premium_rpm: int = Field(default=600, env="CLIENT_TIER_PREMIUM_RPM")
+    client_tier_premium_rpm: int = Field(default=600, validation_alias="CLIENT_TIER_PREMIUM_RPM")
     client_tier_premium_daily_bytes: int = Field(
-        default=107_374_182_400, env="CLIENT_TIER_PREMIUM_DAILY_BYTES"
+        default=107_374_182_400, validation_alias="CLIENT_TIER_PREMIUM_DAILY_BYTES"
     )  # 100GB
-    client_tier_premium_concurrent: int = Field(default=50, env="CLIENT_TIER_PREMIUM_CONCURRENT")
+    client_tier_premium_concurrent: int = Field(default=50, validation_alias="CLIENT_TIER_PREMIUM_CONCURRENT")
 
     # ==========================================================================
     # CORS Settings
     # ==========================================================================
     # Allowed origins for CORS (comma-separated, use "*" for all - NOT RECOMMENDED for production)
-    cors_allowed_origins: str = Field(default="", env="CORS_ALLOWED_ORIGINS")
+    cors_allowed_origins: str = Field(default="", validation_alias="CORS_ALLOWED_ORIGINS")
 
     # Allow credentials (cookies, authorization headers)
-    cors_allow_credentials: bool = Field(default=False, env="CORS_ALLOW_CREDENTIALS")
+    cors_allow_credentials: bool = Field(default=False, validation_alias="CORS_ALLOW_CREDENTIALS")
 
     # Allowed HTTP methods (comma-separated)
     cors_allowed_methods: str = Field(
-        default="GET,POST,PUT,DELETE,OPTIONS", env="CORS_ALLOWED_METHODS"
+        default="GET,POST,PUT,DELETE,OPTIONS", validation_alias="CORS_ALLOWED_METHODS"
     )
 
     # Allowed HTTP headers (comma-separated)
-    cors_allowed_headers: str = Field(default="*", env="CORS_ALLOWED_HEADERS")
+    cors_allowed_headers: str = Field(default="*", validation_alias="CORS_ALLOWED_HEADERS")
 
     # ==========================================================================
     # Compliance / Audit Settings
     # ==========================================================================
     # Enable audit event publishing to BeamCore
-    audit_enabled: bool = Field(default=True, env="AUDIT_ENABLED")
+    audit_enabled: bool = Field(default=True, validation_alias="AUDIT_ENABLED")
 
     # Redis URL for audit event queue (same Redis as BeamCore consumes from)
-    audit_redis_url: Optional[str] = Field(default=None, env="AUDIT_REDIS_URL")
+    audit_redis_url: Optional[str] = Field(default=None, validation_alias="AUDIT_REDIS_URL")
 
     # Redis stream name for audit events
-    audit_stream: str = Field(default="audit:events", env="AUDIT_STREAM")
+    audit_stream: str = Field(default="audit:events", validation_alias="AUDIT_STREAM")
 
     # Source identifier for audit events
-    audit_source: str = Field(default="datapipe_subnet", env="AUDIT_SOURCE")
+    audit_source: str = Field(default="datapipe_subnet", validation_alias="AUDIT_SOURCE")
 
     class Config:
         env_file = ".env"
