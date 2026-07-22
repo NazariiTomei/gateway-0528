@@ -177,24 +177,6 @@ TRANSFER_THROUGHPUT = Histogram(
     buckets=(10, 25, 50, 100, 250, 500, 1000, 2500),
 )
 
-# Proof metrics
-PROOFS_SUBMITTED = Counter(
-    "beam_proofs_submitted_total",
-    "Total proof-of-bandwidth submissions",
-    ["status"],  # valid, invalid, pending
-)
-
-PROOFS_AGGREGATED = Counter(
-    "beam_proofs_aggregated_total",
-    "Total proofs aggregated into reports",
-)
-
-PROOF_LATENCY = Histogram(
-    "beam_proof_submission_latency_seconds",
-    "Latency from task completion to proof submission",
-    buckets=(0.1, 0.5, 1.0, 2.5, 5.0, 10.0),
-)
-
 # Epoch metrics
 EPOCH_NUMBER = Gauge(
     "beam_current_epoch",
@@ -209,19 +191,6 @@ EPOCH_TASKS = Gauge(
 EPOCH_BYTES = Gauge(
     "beam_epoch_bytes",
     "Bytes transferred in current epoch",
-)
-
-# Validator metrics
-VALIDATOR_REPORTS_SENT = Counter(
-    "beam_validator_reports_total",
-    "Total reports sent to validators",
-    ["status"],  # success, failed
-)
-
-VALIDATOR_CHALLENGES_RECEIVED = Counter(
-    "beam_validator_challenges_total",
-    "Total challenges received from validators",
-    ["status"],  # passed, failed
 )
 
 # Rate limiting metrics
@@ -252,15 +221,15 @@ UPTIME = Gauge(
     "Service uptime in seconds",
 )
 
-# BeamCore control-plane path via orch-gateway → BeamCore upstream relay
+# BeamCore control path via NATS control
 BEAMCORE_UPSTREAM_DEGRADED = Gauge(
     "beam_beamcore_upstream_degraded",
-    "1 while orch-gateway reports BeamCore upstream disconnected (relay unavailable)",
+    "1 while the BeamCore NATS control connection is degraded",
 )
 
 BEAMCORE_UPSTREAM_DOWN_EVENTS = Counter(
     "beam_beamcore_upstream_down_events_total",
-    "Times orch-gateway signaled BeamCore upstream loss (upstream_down)",
+    "Times the BeamCore NATS control connection reported upstream_down",
 )
 
 
@@ -400,25 +369,6 @@ class MetricsCollector:
         TRANSFER_BYTES.labels(direction="egress").inc(bytes_transferred)
         TRANSFER_THROUGHPUT.observe(throughput_mbps)
 
-    def record_proof(self, status: str, latency: float) -> None:
-        """Record proof submission metrics."""
-        PROOFS_SUBMITTED.labels(status=status).inc()
-        PROOF_LATENCY.observe(latency)
-
-    def record_proof_aggregation(self, count: int) -> None:
-        """Record proof aggregation."""
-        PROOFS_AGGREGATED.inc(count)
-
-    def record_validator_report(self, success: bool) -> None:
-        """Record validator report sending."""
-        status = "success" if success else "failed"
-        VALIDATOR_REPORTS_SENT.labels(status=status).inc()
-
-    def record_validator_challenge(self, passed: bool) -> None:
-        """Record validator challenge result."""
-        status = "passed" if passed else "failed"
-        VALIDATOR_CHALLENGES_RECEIVED.labels(status=status).inc()
-
     def record_rate_limit(self, limit_type: str) -> None:
         """Record rate limit hit."""
         RATE_LIMIT_HITS.labels(type=limit_type).inc()
@@ -481,7 +431,7 @@ class MetricsMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         """Process request and collect metrics."""
-        # Skip WebSocket requests — BaseHTTPMiddleware cannot handle them
+        # Skip WebSocket requests handled outside BaseHTTPMiddleware
         if request.scope.get("type") == "websocket":
             return await call_next(request)
 

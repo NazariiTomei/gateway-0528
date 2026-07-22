@@ -1,16 +1,11 @@
 """
 BeamCore HTTP client for the validator neuron.
 
-Authentication
---------------
-All routes authenticate with validator hotkey signatures via the standard header fields
-(`X-Validator-Hotkey`, `X-Validator-Signature`, `X-Validator-Timestamp`, `X-Validator-Nonce`,
-`X-Validator-Action`).
-
-`set_weights` and recommended-weight logic read the signed **epoch-summary** response. PoB endpoints cover
-proof listing and verification.
+`POST /validators/heartbeat`, `POST /validators/weights/proof`, and
+`GET /Validator/epoch-summary/latest-epoch` authenticate with validator hotkey
+signatures via the standard header fields. UID and network configuration routes
+use the validator API key when one is configured.
 """
-
 import logging
 import secrets
 import time
@@ -41,8 +36,18 @@ def build_signed_auth_headers(
     }
 
 
+@dataclass
+class UIDRanges:
+    public_orchestrator_uid_start: int
+    public_orchestrator_uid_end: int
+    max_orchestrators: int
+
+    def is_valid_orchestrator_uid(self, uid: int) -> bool:
+        return self.public_orchestrator_uid_start <= uid <= self.public_orchestrator_uid_end
+
+
 class SubnetCoreClient:
-    """Uses `x-api-key` for PoB; signed validator headers for heartbeat and epoch-summary."""
+    """Uses signed validator headers for heartbeat, weights, and epoch summaries."""
 
     def __init__(
         self,
@@ -80,11 +85,21 @@ class SubnetCoreClient:
         path_only = path.split("?", 1)[0]
         lower = path_only.lower()
 
-        # All routes use validator hotkey signature
+
+        if lower.startswith("/validators/heartbeat") or lower.startswith("/validator/epoch-summary"):
+            headers = self._signed_headers(action)
+            if "headers" in kwargs:
+                headers.update(kwargs.pop("headers"))
+            req_kwargs = dict(kwargs)
+            return await client.request(method, f"{self.base_url}{path}", headers=headers, **req_kwargs)
+
+        # Default (e.g. legacy paths): try signature if wallet present, else minimal
         try:
             headers = self._signed_headers(action) if self.wallet else {"X-Validator-Hotkey": self.validator_hotkey}
         except RuntimeError:
             headers = {"X-Validator-Hotkey": self.validator_hotkey}
+        if self._api_key:
+            headers.setdefault("x-api-key", self._api_key)
         if "headers" in kwargs:
             headers.update(kwargs.pop("headers"))
         return await client.request(method, f"{self.base_url}{path}", headers=headers, **kwargs)
@@ -94,115 +109,6 @@ class SubnetCoreClient:
             await self._client.aclose()
             self._client = None
 
-    async def get_unverified_proofs(
-        self,
-        epoch: Optional[int] = None,
-        limit: int = 100,
-    ) -> Dict[str, Any]:
-        params: Dict[str, Any] = {"limit": limit}
-        if epoch is not None:
-            params["epoch"] = epoch
-        response = await self._request(
-            "GET",
-            "/pob/unverified",
-            action="get_unverified_proofs",
-            params=params,
-        )
-        response.raise_for_status()
-        return response.json()
-
-    async def verify_proof(
-        self,
-        proof_id: str,
-        passed: bool,
-        signature_valid: bool = False,
-        timing_valid: bool = False,
-        bandwidth_valid: bool = False,
-        canary_valid: bool = False,
-        geo_valid: bool = False,
-        verification_notes: Optional[str] = None,
-        measured_latency_ms: Optional[float] = None,
-    ) -> Dict[str, Any]:
-        notes: list = [
-            f"signature_valid={signature_valid}",
-            f"timing_valid={timing_valid}",
-            f"bandwidth_valid={bandwidth_valid}",
-            f"canary_valid={canary_valid}",
-            f"geo_valid={geo_valid}",
-        ]
-        if measured_latency_ms is not None:
-            notes.append(f"measured_latency_ms={measured_latency_ms:.3f}")
-        if verification_notes:
-            notes.append(verification_notes)
-
-        response = await self._request(
-            "POST",
-            f"/pob/{proof_id}/verify",
-            action="verify_proof",
-            json={
-                "passed": passed,
-                "validator_hotkey": self.validator_hotkey,
-                "notes": "; ".join(notes),
-            },
-        )
-        response.raise_for_status()
-        return response.json()
-
-    async def get_latest_data_epoch(self) -> Optional[int]:
-        try:
-            response = await self._request(
-                "GET",
-                "/pob/latest-epoch",
-                action="get_latest_data_epoch",
-            )
-            response.raise_for_status()
-            return response.json().get("epoch")
-        except Exception as exc:
-            logger.warning("Failed to get latest data epoch: %s", exc)
-            return None
-
-    async def get_proofs_from_subnetcore(
-        self,
-        epoch: Optional[int] = None,
-        orchestrator_hotkey: Optional[str] = None,
-        worker_id: Optional[str] = None,
-        limit: int = 100,
-        status: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        params: Dict[str, Any] = {"limit": limit}
-        if epoch is not None:
-            params["epoch"] = epoch
-        if orchestrator_hotkey:
-            params["orchestrator_hotkey"] = orchestrator_hotkey
-        if worker_id:
-            params["worker_id"] = worker_id
-        if status:
-            params["status"] = status
-        response = await self._request(
-            "GET",
-            "/pob",
-            action="get_proofs",
-            params=params,
-        )
-        response.raise_for_status()
-        return response.json()
-
-    async def get_proof(self, task_id: str) -> Dict[str, Any]:
-        """Get a specific proof by task ID."""
-        try:
-            response = await self._request(
-                "GET",
-                f"/pob/proof/{task_id}",
-                action="get_proof",
-            )
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error fetching proof: {e.response.status_code}")
-            raise
-        except Exception as e:
-            logger.error(f"Error fetching proof: {e}")
-            raise
 
     async def get_latest_epoch_summary(self) -> Dict[str, Any]:
         """Latest epoch summary from BeamCore (signed validator request)."""
@@ -213,6 +119,37 @@ class SubnetCoreClient:
         )
         response.raise_for_status()
         return response.json()
+
+    async def get_uid_ranges(self) -> Optional[UIDRanges]:
+        client = await self._get_client()
+        headers: Dict[str, str] = {}
+        if self._api_key:
+            headers["x-api-key"] = self._api_key
+        try:
+            response = await client.get(f"{self.base_url}/config/uid-ranges", headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            return UIDRanges(
+                public_orchestrator_uid_start=data["public_orchestrator_uid_start"],
+                public_orchestrator_uid_end=data["public_orchestrator_uid_end"],
+                max_orchestrators=data["max_orchestrators"],
+            )
+        except Exception as exc:
+            logger.error("Error fetching UID ranges: %s", exc)
+            return None
+
+    async def get_network_config(self) -> Optional[dict]:
+        client = await self._get_client()
+        headers: Dict[str, str] = {}
+        if self._api_key:
+            headers["x-api-key"] = self._api_key
+        try:
+            response = await client.get(f"{self.base_url}/config/network", headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            logger.warning("Error fetching network config: %s", exc)
+            return None
 
     async def submit_weight_proof(
         self,
@@ -265,6 +202,7 @@ class SubnetCoreClient:
                 "last_epoch_scored": last_epoch_scored,
                 "health_info": health_info,
                 "external_url": external_url,
+                "needs_api_key": self._api_key is None,
             },
         )
         response.raise_for_status()

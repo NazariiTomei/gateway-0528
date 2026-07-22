@@ -9,8 +9,7 @@ Run your own worker gateway at `gateway.firefoxnode.com` (or any host) so worker
 | Worker WebSocket | `wss://gateway.firefoxnode.com/ws/{worker_id}?api_key=...&hotkey=...&region=europe` |
 | Orchestrator control | `wss://gateway.firefoxnode.com/control` + header `x-control-secret` |
 | Worker list (private) | `GET /get-firefox-workers` + header `x-control-secret` |
-| Orchestrator ↔ BeamCore | `ORCH_GATEWAY_URL` (unchanged) |
-| Worker payment evidence | `CORE_SERVER_URL` HTTP (unchanged) |
+| Orchestrator ↔ BeamCore | `ORCH_GATEWAY_URL` — NATS control session, `nats://` or `tls://` (e.g. `tls://orch-gateway.b1m.ai:4222`) |
 
 ## 1. Start the gateway (port 8001)
 
@@ -51,7 +50,7 @@ In `neurons/orchestrator/.env`:
 
 ```bash
 CORE_SERVER_URL=https://beamcore.b1m.ai
-ORCH_GATEWAY_URL=https://orch-gateway.b1m.ai
+ORCH_GATEWAY_URL=tls://orch-gateway.b1m.ai:4222
 
 WORKER_GATEWAY_PUBLIC_URL=https://gateway.firefoxnode.com
 WORKER_GATEWAY_CONTROL_URL=https://gateway.firefoxnode.com
@@ -64,8 +63,8 @@ Restart the orchestrator. On startup it will:
 
 - Register `gateway_url` with BeamCore
 - Connect to `/control` on your gateway
-- Receive `worker_task_offer_batch` from BeamCore and dispatch offers to connected workers
-- Relay `task_accept`, `task_reject`, and `task_result` between workers and BeamCore
+- Receive task offer batches from BeamCore over NATS and dispatch `task_offer` to connected workers
+- Relay `task_result` from workers to BeamCore (retrying until a terminal status), then relay the `task_result_ack` back to the worker
 
 ## 4. Point workers at your gateway
 
@@ -102,8 +101,7 @@ Invalid or missing region is stored as `unknown` until a valid region is sent on
 - [ ] `GET /get-firefox-workers` shows `control_connected: true` while orchestrator runs
 - [ ] Worker logs `[WS] Connected!` to your domain
 - [ ] Orchestrator logs `Dedicated worker gateway enabled`
-- [ ] After a task: worker sends `task_result`, orchestrator relays to BeamCore, worker gets `task_result_ack`
-- [ ] Worker posts payment evidence only after `task_result_summary_ack.received=true`
+- [ ] After a task: worker sends `task_result`, orchestrator relays to BeamCore, worker gets a terminal `task_result_ack`
 
 ## systemd (optional)
 
@@ -133,10 +131,8 @@ WantedBy=multi-user.target
 | ------- | --- |
 | **HTTP 502** on worker WebSocket | Gateway process not running on port 8001, or Caddy `reverse_proxy` points at the wrong host/port. Confirm `python main.py` is running on the Caddy host. |
 | Worker WebSocket **4401** after connect | Missing `?api_key=` — worker must register with BeamCore first; or set `GATEWAY_REQUIRE_API_KEY=false` only for debugging. |
-| `409 task_not_completed` on payment evidence | Orchestrator not relaying `worker_response` / `task_result_summary` — check control secret and orch logs |
-| `persist_timeout` on `task_result_summary_ack` | BeamCore did not persist the relayed result in time. Restart orch/worker after updating (relay now includes `chunk_index`, `assignment_id`, `bytes_relayed`). If it persists, open a BeamCore ticket with task/transfer IDs — your worker already moved the bytes. |
-| Transfer expires after successful chunk | Same as `persist_timeout` — transfer stays open until BeamCore accepts `task_result_summary` with `received=true` |
-| Worker `Task result ack timeout` | Raise `WORKER_TASK_RESULT_ACK_TIMEOUT` (default 15s) or fix orch forwarding `task_result_summary_ack` to gateway |
+| `task_result` never reaches a terminal ack | Orchestrator not relaying `task_result` to BeamCore, or BeamCore hasn't reached a terminal status yet — check control secret and orch logs; the relay retries automatically until terminal |
+| Worker `Task result ack timeout` | Raise `WORKER_TASK_RESULT_ACK_TIMEOUT` or fix orch forwarding `task_result_ack` to the gateway |
 | `control_connected: false` | `WORKER_GATEWAY_CONTROL_SECRET` mismatch or orchestrator cannot reach control URL |
 | No tasks | `READY=true`, workers connected, orchestrator registered on subnet 105 |
 

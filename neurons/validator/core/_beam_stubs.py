@@ -6,16 +6,16 @@ validation logic is handled by BeamCore.
 """
 
 import hashlib
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import IntEnum
-from typing import Any, Dict, List, Optional, Tuple
-import os
-
+from typing import Any, Dict, List, Optional
 
 # ============================================================================
 # beam.crypto.hashing
 # ============================================================================
+
 
 def sha256(data: bytes) -> bytes:
     """Compute SHA256 hash, return bytes."""
@@ -34,6 +34,7 @@ def compute_canary_proof(canary: bytes, data: bytes) -> str:
 # beam.crypto.signatures
 # ============================================================================
 
+
 def verify_hotkey_signature(message: bytes, signature: str, hotkey: str) -> bool:
     """Verify a hotkey signature. Returns True for now (validation in BeamCore)."""
     # Actual signature verification is done by BeamCore
@@ -46,6 +47,11 @@ def verify_hotkey_signature(message: bytes, signature: str, hotkey: str) -> bool
 
 CHUNK_SIZE_BYTES: int = 10_485_760  # 10 MB
 CANARY_SIZE_BYTES: int = 32
+
+# UID layout (overridden at startup from BeamCore /config/uid-ranges when available)
+PUBLIC_ORCHESTRATOR_UID_START = int(os.getenv("PUBLIC_ORCHESTRATOR_UID_START", "1"))
+PUBLIC_ORCHESTRATOR_UID_END = int(os.getenv("PUBLIC_ORCHESTRATOR_UID_END", "64"))
+MAX_ORCHESTRATORS = int(os.getenv("MAX_ORCHESTRATORS", "64"))
 SCORE_WEIGHT_BANDWIDTH: float = 0.50
 SCORE_WEIGHT_UPTIME: float = 0.20
 SCORE_WEIGHT_LOSS: float = 0.15
@@ -57,21 +63,16 @@ BANDWIDTH_EMA_ALPHA: float = 0.3
 # beam.protocol.task
 # ============================================================================
 
-class SLALevel(IntEnum):
-    BEST_EFFORT = 0
-    STANDARD = 1
-    PREMIUM = 2
-
 
 @dataclass
 class Task:
     """Bandwidth task."""
+
     task_id: bytes = b""
     validator_hotkey: str = ""
     chunk_hash: bytes = b""
     chunk_size: int = 0
     deadline: int = 0
-    sla_level: SLALevel = SLALevel.BEST_EFFORT
     canary: bytes = b""
     canary_offset: int = 0
     path: List[str] = field(default_factory=list)
@@ -82,9 +83,11 @@ class Task:
 # beam.protocol.pob
 # ============================================================================
 
+
 @dataclass
 class PoBVerificationResult:
     """Result of PoB verification."""
+
     valid: bool = False
     error: Optional[str] = None
     bandwidth_mbps: float = 0.0
@@ -93,6 +96,7 @@ class PoBVerificationResult:
 @dataclass
 class ProofOfBandwidth:
     """Proof of Bandwidth submission."""
+
     task_id: str
     worker_id: str
     worker_hotkey: str
@@ -149,6 +153,7 @@ try:
 
     class BandwidthChallenge(bt.Synapse):
         """Bandwidth challenge synapse for dendrite communication."""
+
         task_id: str = PydanticField(default="", description="Unique task identifier")
         challenge_nonce: str = PydanticField(default="", description="Random nonce")
         chunk_hash: str = PydanticField(default="", description="Hash of chunk")
@@ -158,7 +163,6 @@ try:
         canary_offset: int = PydanticField(default=0, description="Canary offset")
         path: List[str] = PydanticField(default_factory=list, description="Relay path")
         expected_hops: int = PydanticField(default=1, description="Expected hops")
-        sla_level: int = PydanticField(default=0, description="SLA level")
         accepted: bool = PydanticField(default=False, description="Challenge accepted")
         worker_assigned: Optional[str] = PydanticField(default=None, description="Assigned worker")
 
@@ -167,6 +171,7 @@ try:
 
     class BandwidthProof(bt.Synapse):
         """Bandwidth proof synapse."""
+
         task_id: str = PydanticField(default="", description="Task ID")
         worker_id: str = PydanticField(default="", description="Worker ID")
         worker_hotkey: str = PydanticField(default="", description="Worker hotkey")
@@ -184,6 +189,7 @@ try:
 
     class WorkerStatusQuery(bt.Synapse):
         """Worker status query synapse."""
+
         include_workers: bool = PydanticField(default=True)
         include_capacity: bool = PydanticField(default=True)
         total_workers: int = PydanticField(default=0)
@@ -195,6 +201,7 @@ try:
 
     class ChunkTransfer(bt.Synapse):
         """Chunk transfer synapse."""
+
         task_id: str = PydanticField(default="", description="Task ID")
         chunk_hash: str = PydanticField(default="", description="Chunk hash")
         chunk_size: int = PydanticField(default=0, description="Size")
@@ -210,6 +217,7 @@ try:
 
     class EpochInfo(bt.Synapse):
         """Epoch info synapse."""
+
         epoch: int = PydanticField(default=0, description="Epoch number")
         epoch_start_block: int = PydanticField(default=0, description="Start block")
         tasks_this_epoch: int = PydanticField(default=0, description="Tasks count")
@@ -222,6 +230,7 @@ except ImportError:
     @dataclass
     class BandwidthChallenge:
         """Bandwidth challenge synapse (fallback)."""
+
         task_id: str = ""
         challenge_nonce: str = ""
         chunk_hash: str = ""
@@ -231,13 +240,13 @@ except ImportError:
         canary_offset: int = 0
         path: List[str] = field(default_factory=list)
         expected_hops: int = 1
-        sla_level: int = 0
         accepted: bool = False
         worker_assigned: Optional[str] = None
 
     @dataclass
     class BandwidthProof:
         """Bandwidth proof synapse (fallback)."""
+
         task_id: str = ""
         worker_id: str = ""
         worker_hotkey: str = ""
@@ -253,6 +262,7 @@ except ImportError:
     @dataclass
     class WorkerStatusQuery:
         """Worker status query synapse (fallback)."""
+
         include_workers: bool = True
         include_capacity: bool = True
         total_workers: int = 0
@@ -262,6 +272,7 @@ except ImportError:
     @dataclass
     class ChunkTransfer:
         """Chunk transfer synapse (fallback)."""
+
         task_id: str = ""
         chunk_hash: str = ""
         chunk_size: int = 0
@@ -275,240 +286,27 @@ except ImportError:
     @dataclass
     class EpochInfo:
         """Epoch info synapse (fallback)."""
+
         epoch: int = 0
         epoch_start_block: int = 0
         tasks_this_epoch: int = 0
 
 
 # ============================================================================
-# beam.scoring.sla
+# Orchestrator helpers
 # ============================================================================
 
-# UID constants (can be overridden by env vars)
-SUBNET_ORCHESTRATOR_UID = int(os.getenv("SUBNET_ORCHESTRATOR_UID", "1"))
-PUBLIC_ORCHESTRATOR_UID_START = int(os.getenv("PUBLIC_ORCHESTRATOR_UID_START", "2"))
-PUBLIC_ORCHESTRATOR_UID_END = int(os.getenv("PUBLIC_ORCHESTRATOR_UID_END", "256"))
-NEW_ORCHESTRATOR_GRACE_PERIOD_HOURS = 24
-
-
-@dataclass
-class SLAMetrics:
-    """SLA metrics for an entity."""
-    uptime: float = 1.0
-    uptime_percent: float = 100.0
-    success_rate: float = 1.0
-    success_rate_percent: float = 100.0
-    acceptance_rate_percent: float = 100.0
-    avg_latency_ms: float = 0.0
-    latency_p95_ms: float = 0.0
-    jitter_ms: float = 0.0
-    bandwidth_mbps: float = 0.0
-    packet_loss_percent: float = 0.0
-    sample_count: int = 0
-    measurement_start: Optional[datetime] = None
-    measurement_end: Optional[datetime] = None
-
-    @classmethod
-    def from_latency_samples(
-        cls,
-        latency_samples: Optional[List[float]] = None,
-        uptime_percent: float = 100.0,
-        bandwidth_mbps: float = 0.0,
-        acceptance_rate_percent: float = 100.0,
-        success_rate_percent: float = 100.0,
-        measurement_start: Optional[datetime] = None,
-        measurement_end: Optional[datetime] = None,
-    ) -> "SLAMetrics":
-        """Create SLAMetrics from latency samples.
-
-        Args:
-            latency_samples: List of latency measurements in milliseconds
-            uptime_percent: Uptime percentage (0-100)
-            bandwidth_mbps: Measured bandwidth in Mbps
-            acceptance_rate_percent: Task acceptance rate (0-100)
-            success_rate_percent: Task success rate (0-100)
-            measurement_start: Start of measurement window
-            measurement_end: End of measurement window
-
-        Returns:
-            SLAMetrics instance with computed values
-        """
-        samples = latency_samples or []
-        avg_latency = sum(samples) / len(samples) if samples else 0.0
-        # P95 approximation: use 95th percentile if enough samples, else use avg
-        p95_latency = (
-            sorted(samples)[int(len(samples) * 0.95)] if len(samples) >= 20 else avg_latency
-        )
-        return cls(
-            uptime=uptime_percent / 100.0,
-            uptime_percent=uptime_percent,
-            success_rate=success_rate_percent / 100.0,
-            success_rate_percent=success_rate_percent,
-            acceptance_rate_percent=acceptance_rate_percent,
-            avg_latency_ms=avg_latency,
-            latency_p95_ms=p95_latency,
-            bandwidth_mbps=bandwidth_mbps,
-            sample_count=len(samples),
-            measurement_start=measurement_start,
-            measurement_end=measurement_end,
-        )
-
-
-@dataclass
-class SLAMultipliers:
-    """SLA component multipliers."""
-    uptime: float = 1.0
-    bandwidth: float = 1.0
-    latency: float = 1.0
-    jitter: float = 1.0
-    acceptance: float = 1.0
-    success: float = 1.0
-
-
-@dataclass
-class SLAScore:
-    """Calculated SLA score."""
-    raw_score: float = 1.0
-    penalty_multiplier: float = 1.0
-    final_score: float = 1.0
-    effective_multiplier: float = 1.0
-    combined_multiplier: float = 1.0
-    penalty_redirect_percent: float = 0.0
-    in_grace_period: bool = False
-    violations: List[str] = field(default_factory=list)
-    multipliers: SLAMultipliers = field(default_factory=SLAMultipliers)
-
-
-@dataclass
-class OrchestratorSLAState:
-    """SLA state for an orchestrator."""
-    uid: int = 0
-    hotkey: str = ""
-    metrics: Optional[SLAMetrics] = None
-    score: Optional[SLAScore] = None
-    in_grace_period: bool = False
-    is_subnet_owned: bool = False
-    registered_at: Optional[datetime] = None
-    grace_period_ends: Optional[datetime] = None
-
-
-@dataclass
-class WorkerSLAState:
-    """SLA state for a worker."""
-    worker_id: str = ""
-    hotkey: str = ""
-    metrics: SLAMetrics = field(default_factory=SLAMetrics)
-    score: SLAScore = field(default_factory=SLAScore)
-
-
-class SLAScorer:
-    """SLA scorer (stub - scoring done by BeamCore)."""
-
-    def __init__(self, **kwargs):
-        pass
-
-    def calculate_score(self, metrics: SLAMetrics) -> SLAScore:
-        return SLAScore()
-
-    def get_penalty_multiplier(self, violations: List[str]) -> float:
-        return 1.0
-
-    def score_orchestrator(self, sla_state: "OrchestratorSLAState") -> SLAScore:
-        """Score an orchestrator based on SLA state."""
-        return SLAScore(
-            raw_score=1.0,
-            penalty_multiplier=1.0,
-            final_score=1.0,
-            effective_multiplier=1.0,
-            combined_multiplier=1.0,
-        )
-
-    def score_worker(self, sla_state: "WorkerSLAState") -> SLAScore:
-        """Score a worker based on SLA state."""
-        return SLAScore()
-
-
-class SLARewardCalculator:
-    """SLA reward calculator (stub - calculations done by BeamCore)."""
-
-    def __init__(self, sla_scorer=None, **kwargs):
-        self.sla_scorer = sla_scorer
-
-    def calculate_rewards(self, scores: Dict[int, float], total_emission: int) -> Dict[int, int]:
-        return {}
-
-
-# ============================================================================
-# beam.orchestrator
-# ============================================================================
 
 @dataclass
 class Orchestrator:
     """Orchestrator data."""
+
     uid: int = 0
     hotkey: str = ""
     url: str = ""
     status: str = "active"
     worker_count: int = 0
     is_subnet_owned: bool = False
-    sla_state: Optional["OrchestratorSLAState"] = None
-
-
-class OrchestratorManager:
-    """Orchestrator manager (stub - management done by BeamCore)."""
-
-    def __init__(self, **kwargs):
-        self.orchestrators: Dict[int, Orchestrator] = {}
-
-    def get_orchestrator(self, uid: int) -> Optional[Orchestrator]:
-        return self.orchestrators.get(uid)
-
-    def get_all_orchestrators(self) -> List[Orchestrator]:
-        return list(self.orchestrators.values())
-
-    def list_orchestrators(self) -> List[Orchestrator]:
-        return list(self.orchestrators.values())
-
-    def register_orchestrator(self, uid: int, hotkey: str, **kwargs) -> Orchestrator:
-        """Register a new orchestrator."""
-        if uid in self.orchestrators:
-            raise ValueError(f"Orchestrator UID {uid} already registered")
-        orch = Orchestrator(uid=uid, hotkey=hotkey)
-        self.orchestrators[uid] = orch
-        return orch
-
-    def update_orchestrator(self, uid: int, **kwargs) -> Optional[Orchestrator]:
-        """Update an existing orchestrator."""
-        orch = self.orchestrators.get(uid)
-        if orch:
-            for key, value in kwargs.items():
-                if hasattr(orch, key):
-                    setattr(orch, key, value)
-        return orch
-
-    def update_all_statuses(self) -> None:
-        """Update statuses for all orchestrators (stub - done by BeamCore)."""
-        pass
-
-    def remove_orchestrator(self, uid: int) -> bool:
-        """Remove an orchestrator."""
-        if uid in self.orchestrators:
-            del self.orchestrators[uid]
-            return True
-        return False
-
-    def update_orchestrator_metrics(self, uid: int, metrics: Any) -> None:
-        """Update orchestrator metrics (stub - done by BeamCore)."""
-        pass
-
-    def get_network_stats(self) -> Dict[str, Any]:
-        """Get network statistics (stub)."""
-        return {
-            "total_orchestrators": len(self.orchestrators),
-            "active_orchestrators": len(self.orchestrators),
-            "total_bandwidth_mbps": 0.0,
-        }
-
 
 class WorkerRegistry:
     """Worker registry (stub - registry in BeamCore)."""
@@ -519,6 +317,9 @@ class WorkerRegistry:
     def get_worker(self, worker_id: str) -> Optional[Any]:
         return self.workers.get(worker_id)
 
+    def get_stats(self) -> Dict[str, Any]:
+        return {"total_workers": len(self.workers)}
+
 
 class ReassignmentManager:
     """Task reassignment manager (stub)."""
@@ -527,7 +328,7 @@ class ReassignmentManager:
         self.worker_registry = worker_registry
         self.pending_reassignments: List[Any] = []
 
-    def check_and_queue_sla_reassignments(self) -> List[Any]:
+    def check_and_queue_reassignments(self) -> List[Any]:
         return []
 
     def process_pending_reassignments(self) -> List[Any]:
@@ -536,10 +337,14 @@ class ReassignmentManager:
     async def reassign_task(self, task_id: str, new_worker_id: str) -> bool:
         return True
 
+    def get_stats(self) -> Dict[str, Any]:
+        return {"pending": len(self.pending_reassignments)}
+
 
 # ============================================================================
 # beam.validation.sybil_detector
 # ============================================================================
+
 
 class SybilViolationType(IntEnum):
     NONE = 0
@@ -551,6 +356,7 @@ class SybilViolationType(IntEnum):
 @dataclass
 class SybilDetectionResult:
     """Result of sybil detection."""
+
     is_sybil: bool = False
     violation_type: SybilViolationType = SybilViolationType.NONE
     confidence: float = 0.0
@@ -592,12 +398,14 @@ def check_path_sybil(path: List[str]) -> SybilDetectionResult:
 
 
 # ============================================================================
-# beam.cross_verification
+# Cross-verification helpers
 # ============================================================================
+
 
 @dataclass
 class ProofSubmission:
     """Cross-verification proof submission."""
+
     proof_id: str = ""
     validator_hotkey: str = ""
     epoch: int = 0
@@ -613,12 +421,14 @@ class ProofSubmission:
 
 
 # ============================================================================
-# beam.cross_verification - Additional types for cross_verification service
+# Additional cross-verification types
 # ============================================================================
+
 
 @dataclass
 class AnonymizedProof:
     """Anonymized proof for cross-verification."""
+
     proof_id: str = ""
     proof_hash: str = ""
 
@@ -626,6 +436,7 @@ class AnonymizedProof:
 @dataclass
 class VerificationCommitment:
     """Verification commitment."""
+
     commitment_hash: str = ""
     epoch: int = 0
 
@@ -633,6 +444,7 @@ class VerificationCommitment:
 @dataclass
 class VerificationReveal:
     """Verification reveal."""
+
     commitment_hash: str = ""
     revealed_data: str = ""
 
@@ -640,6 +452,7 @@ class VerificationReveal:
 @dataclass
 class ProofVerificationResult:
     """Result of proof verification."""
+
     proof_id: str = ""
     valid: bool = True
     verdict: str = ""
@@ -654,6 +467,7 @@ class VerificationVerdict(IntEnum):
 @dataclass
 class AggregatedVerification:
     """Aggregated verification result."""
+
     proof_id: str = ""
     consensus_verdict: VerificationVerdict = VerificationVerdict.VALID
 
@@ -666,6 +480,7 @@ class AggregationStatus(IntEnum):
 @dataclass
 class OrchestratorPenalty:
     """Penalty for an orchestrator."""
+
     orchestrator_uid: int = 0
     penalty_multiplier: float = 1.0
 
@@ -673,6 +488,7 @@ class OrchestratorPenalty:
 @dataclass
 class VerifierPenalty:
     """Penalty for a verifier."""
+
     verifier_hotkey: str = ""
     penalty_multiplier: float = 1.0
 
@@ -680,6 +496,7 @@ class VerifierPenalty:
 @dataclass
 class CrossVerificationConfig:
     """Configuration for cross-verification."""
+
     commit_duration_blocks: int = 100
     reveal_duration_blocks: int = 100
     min_verifiers_per_proof: int = 3
@@ -690,6 +507,7 @@ DEFAULT_CONFIG = CrossVerificationConfig()
 
 class ProofRegistry:
     """Proof registry (stub)."""
+
     def __init__(self):
         self.proofs: Dict[str, ProofSubmission] = {}
 
@@ -724,11 +542,14 @@ def get_epoch_random_seed(epoch: int) -> bytes:
 @dataclass
 class VerifierAssignments:
     """Verifier assignments for an epoch."""
+
     epoch: int = 0
     assignments: Dict[str, List[str]] = field(default_factory=dict)
 
 
-def generate_epoch_assignments(epoch: int, verifiers: List[str], proofs: List[str]) -> VerifierAssignments:
+def generate_epoch_assignments(
+    epoch: int, verifiers: List[str], proofs: List[str]
+) -> VerifierAssignments:
     """Generate random verification assignments."""
     return VerifierAssignments(epoch=epoch)
 
@@ -743,6 +564,7 @@ class VerificationPhase(IntEnum):
 @dataclass
 class EpochPhaseInfo:
     """Info about current epoch phase."""
+
     epoch: int = 0
     phase: VerificationPhase = VerificationPhase.WORK
     blocks_remaining: int = 0
@@ -750,6 +572,7 @@ class EpochPhaseInfo:
 
 class CommitRevealManager:
     """Commit-reveal manager (stub)."""
+
     def __init__(self):
         pass
 
@@ -782,12 +605,14 @@ def create_commit_reveal_manager() -> CommitRevealManager:
 @dataclass
 class VerificationContext:
     """Context for verification."""
+
     epoch: int = 0
 
 
 @dataclass
 class OrchestratorVerificationSummary:
     """Summary of orchestrator verification results."""
+
     orchestrator_uid: int = 0
     total_proofs: int = 0
     valid_proofs: int = 0
@@ -803,7 +628,9 @@ def verify_proofs_batch(proofs: List[ProofSubmission]) -> List[ProofVerification
     return [verify_proof(p) for p in proofs]
 
 
-def aggregate_verification_results(results: List[ProofVerificationResult]) -> AggregatedVerification:
+def aggregate_verification_results(
+    results: List[ProofVerificationResult],
+) -> AggregatedVerification:
     """Aggregate verification results."""
     return AggregatedVerification()
 
@@ -813,7 +640,9 @@ def aggregate_epoch_results(epoch: int) -> Dict[str, AggregatedVerification]:
     return {}
 
 
-def summarize_orchestrator_results(orchestrator_uid: int, results: List[ProofVerificationResult]) -> OrchestratorVerificationSummary:
+def summarize_orchestrator_results(
+    orchestrator_uid: int, results: List[ProofVerificationResult]
+) -> OrchestratorVerificationSummary:
     """Summarize results for an orchestrator."""
     return OrchestratorVerificationSummary(orchestrator_uid=orchestrator_uid)
 
@@ -823,12 +652,16 @@ def calculate_orchestrator_penalty(summary: OrchestratorVerificationSummary) -> 
     return OrchestratorPenalty(orchestrator_uid=summary.orchestrator_uid)
 
 
-def calculate_orchestrator_penalties(summaries: List[OrchestratorVerificationSummary]) -> List[OrchestratorPenalty]:
+def calculate_orchestrator_penalties(
+    summaries: List[OrchestratorVerificationSummary],
+) -> List[OrchestratorPenalty]:
     """Calculate penalties for multiple orchestrators."""
     return [calculate_orchestrator_penalty(s) for s in summaries]
 
 
-def calculate_verifier_penalty(verifier_hotkey: str, results: List[ProofVerificationResult]) -> VerifierPenalty:
+def calculate_verifier_penalty(
+    verifier_hotkey: str, results: List[ProofVerificationResult]
+) -> VerifierPenalty:
     """Calculate penalty for a verifier."""
     return VerifierPenalty(verifier_hotkey=verifier_hotkey)
 
@@ -836,6 +669,7 @@ def calculate_verifier_penalty(verifier_hotkey: str, results: List[ProofVerifica
 @dataclass
 class PenaltyHistory:
     """Penalty history for an entity."""
+
     entity_id: str = ""
     penalties: List[float] = field(default_factory=list)
 
@@ -843,6 +677,7 @@ class PenaltyHistory:
 @dataclass
 class EpochPenaltySummary:
     """Summary of penalties for an epoch."""
+
     epoch: int = 0
     orchestrator_penalties: List[OrchestratorPenalty] = field(default_factory=list)
     verifier_penalties: List[VerifierPenalty] = field(default_factory=list)

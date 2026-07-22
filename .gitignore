@@ -59,6 +59,9 @@ temp/
 .tmp-*/
 checkpoint_*.json
 
+# Dedicated worker gateway: live telemetry, not source
+neurons/worker_gateway/data/*.json
+
 # OS
 .DS_Store
 Thumbs.db

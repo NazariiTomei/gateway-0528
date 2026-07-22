@@ -2,7 +2,7 @@
 Validator Core Logic - Unified Version
 
 Validates Proof-of-Bandwidth submissions and sets weights on the Bittensor network.
-Supports both local mode (HTTP) and mainnet (Bittensor dendrite).
+Supports local mode for standalone operation and Bittensor dendrite for network operation.
 
 """
 
@@ -25,11 +25,9 @@ from core._beam_stubs import (
     BANDWIDTH_EMA_ALPHA,
     CANARY_SIZE_BYTES,
     # beam.constants
-    SUBNET_ORCHESTRATOR_UID,
     # beam.protocol.synapse
     BandwidthChallenge,
     ChunkTransfer,
-    OrchestratorManager,
     PoBVerificationResult,
     # beam.protocol.pob
     ProofOfBandwidth,
@@ -106,7 +104,6 @@ class WorkSummary:
 
     # Extended work metrics
     uptime_percent: float = 100.0  # Orchestrator uptime over 24h window
-    acceptance_rate: float = 100.0  # Task acceptance rate
     latency_p95_ms: float = 0.0  # 95th percentile latency
 
     # Worker contribution breakdown
@@ -195,11 +192,13 @@ class Validator:
     - Verify Proof-of-Bandwidth submissions
     - Fetch and verify proofs from SubnetCore API
     - Track orchestrator work and payment/fraud signals
+    - Redirect penalties to Orchestrator #1 (subnet treasury)
+    - Process worker reassignments
     - Set weights on Bittensor network
 
     Supports both:
     - Local mode: HTTP-based communication with orchestrators
-    - Mainnet: Bittensor dendrite-based communication
+    - Network mode: Bittensor dendrite-based communication
     """
 
     def __init__(self, settings: Optional[Settings] = None):
@@ -232,11 +231,10 @@ class Validator:
         # =====================================================================
         # Orchestrator and Worker Management
         # =====================================================================
-        self.orchestrator_manager = OrchestratorManager()
         self.worker_registry = WorkerRegistry()
         self.reassignment_manager = ReassignmentManager(self.worker_registry)
 
-        # Local score cache; BeamCore PRISM remains authoritative.
+        # Local score cache; BeamCore Prism remains authoritative.
         self.orchestrator_scores: Dict[str, float] = {}  # hotkey -> final score
         self.payment_penalty_multipliers: Dict[str, float] = (
             {}
@@ -277,16 +275,16 @@ class Validator:
         self.spot_check_results: Dict[str, SpotCheckResult] = {}  # hotkey -> last result
         self.spot_check_history: List[SpotCheckResult] = []
 
-        # PoB verification stats (populated by _verify_subnet_core_proofs)
+        # Local proof verification stats
         self.pob_verification_results: Dict[str, PoBVerificationStats] = {}  # hotkey -> stats
 
         # Weight history
         self.last_weight_block: int = 0
         self.weights_history: List[Dict] = []
         self._chain_weights_rate_limit: int = 0  # cached from subtensor at startup
-        self._cr_enabled: bool = False  # commit-reveal enabled on this subnet
-        self._cr_interval: int = 0  # commit-reveal epoch length in blocks
-        self.last_weight_cr_epoch: int = -1  # CR epoch in which weights were last set
+        self._cr_enabled: bool = False            # commit-reveal enabled on this subnet
+        self._cr_interval: int = 0               # commit-reveal epoch length in blocks
+        self.last_weight_cr_epoch: int = -1      # CR epoch in which weights were last set
 
         # Penalty history
         self.penalty_history: List[dict] = []
@@ -316,7 +314,7 @@ class Validator:
             logger.debug("Running in LOCAL MODE - skipping Bittensor network connection")
             await self._initialize_local_mode()
         else:
-            # Mainnet mode with Bittensor
+            # Network mode with Bittensor
             await self._initialize_bittensor_mode()
 
         logger.debug("Validator node initialized")
@@ -335,14 +333,14 @@ class Validator:
         self.uid = 1
         self.is_registered = True
 
-        # Connect to subtensor for mainnet
+        # Connect to the configured subtensor network
         if self.settings.subtensor_address:
             self.subtensor = bt.Subtensor(network=self.settings.subtensor_address)
         else:
             self.subtensor = bt.Subtensor(network=self.settings.subtensor_network)
         logger.debug(f"Connected to subtensor: {self.subtensor.network}")
 
-        # Load metagraph for mainnet data
+        # Load metagraph data from the configured network
         try:
             self.metagraph = bt.Metagraph(
                 netuid=self.settings.netuid,
@@ -355,17 +353,22 @@ class Validator:
             self.metagraph = None
 
         # Initialize Fiber chain interface
-        try:
-            self.fiber_chain = FiberChain(
-                subtensor_network=self.settings.subtensor_network,
-                subtensor_address=self.settings.subtensor_address,
-                netuid=self.settings.netuid,
-            )
-            self._fiber_nodes = self.fiber_chain.get_nodes_by_hotkey()
-            logger.debug(f"Fiber chain initialized with {len(self._fiber_nodes)} nodes")
-        except Exception as e:
-            logger.warning("Fiber chain init failed: %s", e, exc_info=True)
+        if os.getenv("BEAM_VALIDATOR_SKIP_FIBER", "").lower() in ("true", "1", "yes"):
             self.fiber_chain = None
+            self._fiber_nodes = {}
+            logger.debug("Fiber chain skipped (BEAM_VALIDATOR_SKIP_FIBER)")
+        else:
+            try:
+                self.fiber_chain = FiberChain(
+                    subtensor_network=self.settings.subtensor_network,
+                    subtensor_address=self.settings.subtensor_address,
+                    netuid=self.settings.netuid,
+                )
+                self._fiber_nodes = self.fiber_chain.get_nodes_by_hotkey()
+                logger.debug(f"Fiber chain initialized with {len(self._fiber_nodes)} nodes")
+            except Exception as e:
+                logger.warning("Fiber chain init failed: %s", e, exc_info=True)
+                self.fiber_chain = None
 
         # Create HTTP session for local mode communication
         self._http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
@@ -412,17 +415,22 @@ class Validator:
         self.metagraph.sync(subtensor=self.subtensor)
 
         # Initialize Fiber chain interface
-        try:
-            self.fiber_chain = FiberChain(
-                subtensor_network=self.settings.subtensor_network,
-                subtensor_address=self.settings.subtensor_address,
-                netuid=self.settings.netuid,
-            )
-            self._fiber_nodes = self.fiber_chain.get_nodes_by_hotkey()
-            logger.debug(f"Fiber chain initialized with {len(self._fiber_nodes)} nodes")
-        except Exception as e:
-            logger.warning("Fiber chain init failed: %s", e, exc_info=True)
+        if os.getenv("BEAM_VALIDATOR_SKIP_FIBER", "").lower() in ("true", "1", "yes"):
             self.fiber_chain = None
+            self._fiber_nodes = {}
+            logger.debug("Fiber chain skipped (BEAM_VALIDATOR_SKIP_FIBER)")
+        else:
+            try:
+                self.fiber_chain = FiberChain(
+                    subtensor_network=self.settings.subtensor_network,
+                    subtensor_address=self.settings.subtensor_address,
+                    netuid=self.settings.netuid,
+                )
+                self._fiber_nodes = self.fiber_chain.get_nodes_by_hotkey()
+                logger.debug(f"Fiber chain initialized with {len(self._fiber_nodes)} nodes")
+            except Exception as e:
+                logger.warning("Fiber chain init failed: %s", e, exc_info=True)
+                self.fiber_chain = None
 
         # Check registration
         await self._check_registration()
@@ -468,22 +476,15 @@ class Validator:
                     "SubtensorModule", "CommitRevealWeightsEnabled", [self.settings.netuid]
                 )
                 self._cr_enabled = bool(cr_result.value) if cr_result else False
-                logger.info(
-                    "CR4 CommitRevealWeightsEnabled for netuid %s: %s",
-                    self.settings.netuid,
-                    self._cr_enabled,
-                )
+                logger.info("CR4 CommitRevealWeightsEnabled for netuid %s: %s", self.settings.netuid, self._cr_enabled)
             except Exception as _exc:
                 logger.warning("Could not read CommitRevealWeightsEnabled: %s", _exc)
             if self._cr_enabled:
-                reveal_period_epochs = 1
                 try:
                     reveal_epochs_result = self.subtensor.query_module(
                         "SubtensorModule", "RevealPeriodEpochs", [self.settings.netuid]
                     )
-                    reveal_period_epochs = (
-                        int(reveal_epochs_result.value) if reveal_epochs_result else 1
-                    )
+                    reveal_period_epochs = int(reveal_epochs_result.value) if reveal_epochs_result else 1
                     tempo = self.subtensor.tempo(self.settings.netuid) or 360
                     self._cr_interval = reveal_period_epochs * tempo
                 except Exception as _exc:
@@ -665,16 +666,15 @@ class Validator:
 
     async def _heartbeat_loop(self) -> None:
         """Send periodic heartbeats to SubnetCore while running."""
-        heartbeat_interval = 60  # seconds
+        heartbeat_interval = max(5, int(self.settings.heartbeat_interval_seconds))
 
         while self._running:
             try:
+                await self._submit_beamcore_heartbeat()
                 await asyncio.sleep(heartbeat_interval)
 
                 if not self._running:
                     break
-
-                await self._submit_beamcore_heartbeat()
 
             except asyncio.CancelledError:
                 break
@@ -693,11 +693,6 @@ class Validator:
                 await self._discover_orchestrators()
                 await self._update_connections()
 
-                # Sync orchestrators from metagraph
-                await self._sync_orchestrators()
-
-                # Query orchestrators for work summaries
-                await self._query_orchestrators()
 
                 # Generate and send bandwidth challenges
                 # DISABLED: Challenges temporarily disabled - endpoint deprecated
@@ -707,12 +702,8 @@ class Validator:
                 # DISABLED: Challenges temporarily disabled - endpoint deprecated
                 # await self._issue_challenges()
 
-                # Collect and verify PoB
+                # Collect and verify local proof submissions
                 await self._collect_pob_results()
-
-                # *** NEW: Verify proofs from SubnetCore API ***
-                await self._verify_subnet_core_proofs()
-
                 # Spot-check proofs
                 await self._spot_check_proofs()
 
@@ -742,197 +733,6 @@ class Validator:
 
             await asyncio.sleep(self.settings.sync_interval)
 
-    # =========================================================================
-    # SubnetCore Proof Verification (NEW)
-    # =========================================================================
-
-    async def _verify_subnet_core_proofs(self) -> None:
-        """
-        Fetch unverified proofs from SubnetCore API and verify them.
-
-        This is the main verification loop that ensures proofs are validated
-        and workers can be compensated.
-        """
-        if not SUBNET_CORE_AVAILABLE or not self.subnet_core_client:
-            logger.debug("SubnetCore client not available, skipping proof verification")
-            return
-
-        try:
-            # Fetch unverified proofs from SubnetCore
-            result = await self.subnet_core_client.get_unverified_proofs(
-                limit=50,  # Process up to 50 proofs per cycle
-            )
-
-            proofs = result.get("proofs", [])
-            if not proofs:
-                logger.debug("No unverified proofs to verify")
-                return
-
-            logger.info(f"Fetched {len(proofs)} unverified proofs from SubnetCore")
-
-            verified_count = 0
-            failed_count = 0
-
-            # Track verified proofs by orchestrator for work summary computation
-            verified_proofs_by_orch: Dict[str, List[dict]] = {}
-            # Track all proofs per orchestrator for PoB stats
-            all_proofs_by_orch: Dict[str, List[dict]] = {}
-            failed_by_orch: Dict[str, int] = {}
-
-            for proof_data in proofs:
-                orch_hotkey = proof_data.get("orchestrator_hotkey", "")
-                if orch_hotkey:
-                    all_proofs_by_orch.setdefault(orch_hotkey, []).append(proof_data)
-
-                try:
-                    verification_result = await self._verify_single_subnet_proof(proof_data)
-
-                    # Submit verification result back to SubnetCore
-                    await self.subnet_core_client.verify_proof(
-                        proof_id=proof_data.get("proof_id"),
-                        passed=verification_result.valid,
-                        signature_valid=verification_result.signature_valid,
-                        timing_valid=verification_result.timing_valid,
-                        bandwidth_valid=verification_result.bandwidth_valid,
-                        canary_valid=verification_result.canary_valid,
-                        geo_valid=verification_result.geo_valid,
-                        verification_notes=verification_result.error,
-                        measured_latency_ms=verification_result.latency_ms,
-                    )
-
-                    if verification_result.valid:
-                        verified_count += 1
-                        # Track verified proof for work summary
-                        if orch_hotkey:
-                            verified_proofs_by_orch.setdefault(orch_hotkey, []).append(proof_data)
-                        logger.debug(
-                            f"Proof {proof_data.get('task_id', 'unknown')[:16]}... verified successfully"
-                        )
-                    else:
-                        failed_count += 1
-                        if orch_hotkey:
-                            failed_by_orch[orch_hotkey] = failed_by_orch.get(orch_hotkey, 0) + 1
-                        logger.warning(
-                            f"Proof {proof_data.get('task_id', 'unknown')[:16]}... failed: "
-                            f"{verification_result.error}"
-                        )
-
-                except Exception as e:
-                    logger.error(f"Error verifying proof: {e}")
-                    failed_count += 1
-                    if orch_hotkey:
-                        failed_by_orch[orch_hotkey] = failed_by_orch.get(orch_hotkey, 0) + 1
-
-            if verified_count > 0 or failed_count > 0:
-                logger.info(
-                    f"SubnetCore verification: {verified_count} passed, {failed_count} failed"
-                )
-
-            # Accumulate per-orchestrator PoB verification stats
-            for hotkey, all_proofs in all_proofs_by_orch.items():
-                verified_list = verified_proofs_by_orch.get(hotkey, [])
-                rejected = failed_by_orch.get(hotkey, 0)
-                prev = self.pob_verification_results.get(hotkey, PoBVerificationStats())
-                self.pob_verification_results[hotkey] = PoBVerificationStats(
-                    total_proofs=prev.total_proofs + len(all_proofs),
-                    verified_count=prev.verified_count + len(verified_list),
-                    rejected_count=prev.rejected_count + rejected,
-                    total_bytes_verified=prev.total_bytes_verified
-                    + sum(p.get("bytes_relayed", 0) for p in verified_list),
-                )
-
-            # Build work summaries from verified proofs
-            await self._build_work_summaries_from_proofs(verified_proofs_by_orch)
-
-        except Exception as e:
-            logger.error(f"Error fetching/verifying SubnetCore proofs: {e}")
-
-    async def _build_work_summaries_from_proofs(
-        self,
-        verified_proofs_by_orch: Dict[str, List[dict]],
-    ) -> None:
-        """
-        Build work summaries from verified proofs fetched from SubnetCore.
-
-        This replaces the need to query orchestrators directly for summaries.
-        The validator computes summaries from the proofs it has already verified.
-        """
-        if not verified_proofs_by_orch:
-            return
-
-        for orch_hotkey, proofs in verified_proofs_by_orch.items():
-            if not proofs:
-                continue
-
-            # Aggregate metrics from proofs
-            total_bytes = sum(p.get("bytes_relayed", 0) for p in proofs)
-            bandwidths = [
-                p.get("bandwidth_mbps", 0.0) for p in proofs if p.get("bandwidth_mbps", 0) > 0
-            ]
-            avg_bandwidth = sum(bandwidths) / len(bandwidths) if bandwidths else 0.0
-
-            # Calculate latencies from timing
-            latencies = []
-            for p in proofs:
-                start = p.get("start_time_us", 0)
-                end = p.get("end_time_us", 0)
-                if end > start:
-                    latencies.append((end - start) / 1000.0)  # Convert to ms
-            avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
-
-            # Count unique workers
-            workers = set(p.get("worker_id", "") for p in proofs if p.get("worker_id"))
-            worker_regions: Dict[str, int] = {}
-            for p in proofs:
-                region = p.get("source_region", "unknown")
-                worker_regions[region] = worker_regions.get(region, 0) + 1
-
-            # Get epoch from proofs (use most common)
-            epochs = [p.get("epoch", 0) for p in proofs]
-            epoch = max(set(epochs), key=epochs.count) if epochs else 0
-
-            # Build WorkSummary
-            summary = WorkSummary(
-                epoch=epoch,
-                orchestrator_hotkey=orch_hotkey,
-                total_tasks=len(proofs),
-                successful_tasks=len(proofs),  # All verified proofs are successful
-                total_bytes_relayed=total_bytes,
-                active_workers=len(workers),
-                avg_bandwidth_mbps=avg_bandwidth,
-                avg_latency_ms=avg_latency,
-                success_rate=1.0,  # All proofs verified
-                proof_count=len(proofs),
-                worker_regions=worker_regions,
-                orchestrator_signature="",  # Not needed for SubnetCore-derived summaries
-                uptime_percent=100.0,  # Assume online if publishing proofs
-                acceptance_rate=100.0,
-                latency_p95_ms=sorted(latencies)[int(len(latencies) * 0.95)] if latencies else 0.0,
-                measurement_start=datetime.utcnow() - timedelta(minutes=5),
-                measurement_end=datetime.utcnow(),
-            )
-
-            # Update work summaries
-            self.work_summaries[orch_hotkey] = summary
-
-            # Auto-register orchestrator if not known (for SubnetCore-driven scoring)
-            if orch_hotkey not in self.orchestrators:
-                # Get UID from proofs if available
-                orch_uid = proofs[0].get("orchestrator_uid", 0) if proofs else 0
-                self.orchestrators[orch_hotkey] = OrchestratorInfo(
-                    url="http://unknown",  # Not needed for SubnetCore flow
-                    hotkey=orch_hotkey,
-                    uid=orch_uid,
-                    is_healthy=True,
-                )
-                logger.info(
-                    f"Auto-registered orchestrator {orch_hotkey[:16]}... from SubnetCore proofs"
-                )
-
-            logger.info(
-                f"Built work summary for {orch_hotkey[:16]}...: "
-                f"{len(proofs)} proofs, {total_bytes:,} bytes, {avg_bandwidth:.1f} Mbps"
-            )
 
     async def _verify_single_subnet_proof(self, proof_data: dict) -> ProofVerificationResult:
         """
@@ -1034,7 +834,7 @@ class Validator:
                     )
                     return result
             else:
-                # No signature provided - log warning but allow for now
+                # No signature provided — log warning but allow for now
                 # TODO: Make signatures required once orchestrator signing is implemented
                 logger.debug(f"No worker signature for {task_id[:16]}... (unsigned proof)")
                 result.signature_valid = True
@@ -1124,7 +924,7 @@ class Validator:
                 "last_seen": datetime.utcnow(),
             }
 
-        logger.info(
+        logger.debug(
             f"Updated connections: {len(self.connections)} registered, "
             f"{skipped_unregistered} skipped (not registered with BeamCore)"
         )
@@ -1172,31 +972,6 @@ class Validator:
                     return
             except Exception as e:
                 logger.warning(f"BeamCore orchestrator discovery failed: {e}")
-
-    async def _query_orchestrators(self) -> None:
-        """Work summaries are derived from verified BeamCore proofs in-memory."""
-        return
-
-    async def _sync_orchestrators(self) -> None:
-        """Sync orchestrators from metagraph."""
-        if self.metagraph is None:
-            return
-
-        for uid in range(len(self.metagraph.hotkeys)):
-            hotkey = self.metagraph.hotkeys[uid]
-            existing = self.orchestrator_manager.get_orchestrator(uid)
-
-            if existing is None and uid != SUBNET_ORCHESTRATOR_UID:
-                try:
-                    self.orchestrator_manager.register_orchestrator(
-                        uid=uid,
-                        hotkey=hotkey,
-                    )
-                    logger.info(f"Registered new orchestrator UID {uid}")
-                except ValueError as e:
-                    logger.warning(f"Could not register orchestrator UID {uid}: {e}")
-
-        self.orchestrator_manager.update_all_statuses()
 
     # =========================================================================
     # Challenge Generation and Sending
@@ -1346,7 +1121,7 @@ class Validator:
         chunk_data: bytes,
         challenge: BandwidthChallenge,
     ) -> Optional[BandwidthChallenge]:
-        """Send challenge via Bittensor dendrite (for mainnet)"""
+        """Send challenge via Bittensor dendrite."""
         if self.dendrite is None or self.metagraph is None:
             return None
 
@@ -1744,24 +1519,6 @@ class Validator:
         ]
         if eligible:
             logger.info(f"_spot_check_proofs: checking {len(eligible)} eligible orchestrators")
-
-        # Prefetch all epoch proofs in one request to avoid per-orchestrator 429 bursts
-        proof_ids_by_hotkey: Dict[str, List[str]] = {}
-        if SUBNET_CORE_AVAILABLE and self.subnet_core_client:
-            try:
-                result = await self.subnet_core_client.get_proofs_from_subnetcore(
-                    epoch=self.current_epoch,
-                    limit=1000,
-                )
-                for p in result.get("proofs", []):
-                    orch_hk = p.get("orchestrator_hotkey", "")
-                    task_id = p.get("task_id", "")
-                    if orch_hk and task_id:
-                        proof_ids_by_hotkey.setdefault(orch_hk, []).append(task_id)
-                logger.info(f"_spot_check_proofs: prefetched proofs for {len(proof_ids_by_hotkey)} orchestrators")
-            except Exception as e:
-                logger.warning(f"_spot_check_proofs: epoch proof prefetch failed: {e}")
-
         for hotkey, summary in self.work_summaries.items():
             if summary.proof_count == 0:
                 continue
@@ -1771,10 +1528,7 @@ class Validator:
                 continue
 
             try:
-                result = await self._spot_check_orchestrator(
-                    hotkey, orchestrator, summary,
-                    prefetched_ids=proof_ids_by_hotkey.get(hotkey),
-                )
+                result = await self._spot_check_orchestrator(hotkey, orchestrator, summary)
                 self.spot_check_results[hotkey] = result
                 self.spot_check_history.append(result)
 
@@ -1798,7 +1552,6 @@ class Validator:
         hotkey: str,
         orchestrator: OrchestratorInfo,
         summary: WorkSummary,
-        prefetched_ids: List[str] = None,
     ) -> SpotCheckResult:
         """Perform spot-check verification for a single orchestrator."""
         sample_percent = 0.05 + random.random() * 0.05
@@ -1808,7 +1561,7 @@ class Validator:
             f"sampling {sample_size} of {summary.proof_count} proofs ({sample_percent:.1%})"
         )
 
-        proof_ids = await self._get_random_proof_ids(orchestrator, sample_size, prefetched_ids=prefetched_ids)
+        proof_ids = await self._get_random_proof_ids(orchestrator, sample_size)
 
         if not proof_ids:
             logger.warning(f"_spot_check_orchestrator: {hotkey[:16]}... no proof IDs returned")
@@ -1888,70 +1641,34 @@ class Validator:
         self,
         orchestrator: OrchestratorInfo,
         sample_size: int,
-        prefetched_ids: List[str] = None,
     ) -> List[str]:
-        """Get random proof IDs for spot-checking."""
-        # Use prefetched batch if available (avoids per-orchestrator API calls)
-        if prefetched_ids is not None:
-            if not prefetched_ids:
-                return []
-            n = min(sample_size, len(prefetched_ids))
-            return random.sample(prefetched_ids, n)
-
-        # Fallback: per-orchestrator fetch
-        if SUBNET_CORE_AVAILABLE and self.subnet_core_client:
-            try:
-                result = await self.subnet_core_client.get_proofs_from_subnetcore(
-                    epoch=self.current_epoch,
-                    orchestrator_hotkey=orchestrator.hotkey,
-                    limit=sample_size * 2,
-                )
-                proofs = result.get("proofs", [])
-                if proofs:
-                    all_proof_ids = [p.get("task_id", "") for p in proofs if p.get("task_id")]
-                    n = min(sample_size, len(all_proof_ids))
-                    return random.sample(all_proof_ids, n) if all_proof_ids else []
-                return []
-            except Exception as e:
-                logger.warning(
-                    f"BeamCore proof query failed for {orchestrator.hotkey[:16]}...: {e}"
-                )
+        """Return proof IDs for local spot-checking when available."""
         return []
-
     async def _request_proofs(
         self,
         orchestrator: OrchestratorInfo,
         proof_ids: List[str],
     ) -> List[dict]:
-        """Request full proof data for specific proof IDs."""
-        # Use SubnetCore for proof queries (proofs are stored in subnet_pob_registry)
-        if SUBNET_CORE_AVAILABLE and self.subnet_core_client:
-            try:
-                proofs = []
-                for task_id in proof_ids[:10]:  # Limit to avoid too many requests
-                    result = await self.subnet_core_client.get_proof(task_id)
-                    if result and "error" not in result:
-                        proofs.append(result)
-                return proofs
-            except Exception as e:
-                logger.error(f"SubnetCore proof fetch failed: {e}")
-                return []
-
-        # No SubnetCore client available
-        logger.warning("SubnetCore client not available for proof queries")
+        """Return full local proof data for specific proof IDs when available."""
         return []
-
     # =========================================================================
     # Scoring
     # =========================================================================
 
     async def _update_scores(self) -> None:
         """Update local orchestrator scores from work, challenge, fraud, and payment signals."""
-        logger.info(
+        logger.debug(
             f"_update_scores: scoring {len(self.orchestrators)} orchestrators, {len(self.work_summaries)} with summaries"
         )
 
         _baseline_multiplier = 0.1
+        if self.subnet_core_client:
+            try:
+                net_config = await self.subnet_core_client.get_network_config()
+                if net_config and "validator_baseline_multiplier" in net_config:
+                    _baseline_multiplier = float(net_config["validator_baseline_multiplier"])
+            except Exception as e:
+                logger.warning(f"Could not fetch baseline multiplier from SubnetCore: {e}")
 
         for hotkey, info in self.orchestrators.items():
             summary = self.work_summaries.get(hotkey)
@@ -1960,7 +1677,7 @@ class Validator:
                 final_score = 1.0 if info.is_subnet_owned else _baseline_multiplier
                 self.orchestrator_scores[hotkey] = final_score
                 info.last_score = final_score
-                logger.info(
+                logger.debug(
                     f"_update_scores: {hotkey[:16]}... UID={info.uid} "
                     f"no work summary - baseline score={final_score:.4f}"
                 )
@@ -1969,9 +1686,9 @@ class Validator:
             throughput_score = min(max(summary.avg_bandwidth_mbps / 1000.0, 0.0), 1.0)
             reliability_score = min(max(summary.success_rate, 0.0), 1.0)
             work_score = (throughput_score * 0.6) + (reliability_score * 0.4)
+            payment_multiplier = self.payment_penalty_multipliers.get(hotkey, 1.0)
             challenge_multiplier = self._calculate_challenge_multiplier(hotkey)
             fraud_multiplier = self._calculate_fraud_multiplier(hotkey)
-            payment_multiplier = self.payment_penalty_multipliers.get(hotkey, 1.0)
             final_score = work_score * challenge_multiplier * fraud_multiplier * payment_multiplier
 
             self.orchestrator_scores[hotkey] = final_score
@@ -2091,6 +1808,9 @@ class Validator:
 
     async def _maybe_set_weights(self) -> None:
         """Set weights on chain if enough blocks have passed"""
+        if self.settings.disable_weight_set:
+            return
+
         if self.subtensor is None:
             logger.debug("Skipping weight setting - no subtensor")
             return
@@ -2261,7 +1981,7 @@ class Validator:
 
     async def _get_persisted_weight_snapshot(
         self,
-    ) -> Optional[Tuple[List[int], List[float], str, Optional[str], int, bool, str]]:
+    ) -> Optional[Tuple[List[int], List[float], str, Optional[str], int]]:
         """Fetch recommended weights from BeamCore epoch summary (ops-materialized)."""
         if not self.subnet_core_client:
             return None
@@ -2350,14 +2070,9 @@ class Validator:
 
     def get_validator_state(self) -> dict:
         """Get current Validator state"""
-        orchestrator_stats = self.orchestrator_manager.get_network_stats()
+        beamcore_total_workers = sum(self._beamcore_worker_counts.values())
         worker_stats = self.worker_registry.get_stats()
         reassignment_stats = self.reassignment_manager.get_stats()
-
-        # Use BeamCore worker counts instead of internal tracking
-        beamcore_total_workers = sum(self._beamcore_worker_counts.values())
-        orchestrator_stats["total_workers"] = beamcore_total_workers
-        orchestrator_stats["worker_counts_by_uid"] = dict(self._beamcore_worker_counts)
 
         return {
             "uid": self.uid,
@@ -2365,10 +2080,14 @@ class Validator:
             "is_registered": self.is_registered,
             "connections_tracked": len(self.connections),
             "pending_tasks": len(self.pending_tasks),
-            "verified_pob": len([r for r in self.task_results.values() if r.valid]),
+            "verified_proofs": len([r for r in self.task_results.values() if r.valid]),
             "last_weight_block": self.last_weight_block,
             "current_block": self.subtensor.block if self.subtensor else 0,
-            "orchestrators": orchestrator_stats,
+            "orchestrators": {
+                "total_orchestrators": len(self.orchestrators),
+                "total_workers": beamcore_total_workers,
+                "worker_counts_by_uid": dict(self._beamcore_worker_counts),
+            },
             "workers": worker_stats,
             "reassignments": reassignment_stats,
             "total_redirected_to_one_tao": self.total_redirected_to_one,

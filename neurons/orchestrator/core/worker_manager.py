@@ -31,7 +31,7 @@ class WorkerManager:
 
     def __init__(self, settings: OrchestratorSettings, subnet_core_client_ref=None):
         self.settings = settings
-        # Callable that returns subnet_core_client (to avoid circular refs)
+        # Callable that returns subnet_core_client for deferred wiring
         self._get_subnet_core_client = subnet_core_client_ref or (lambda: None)
 
         # Worker registry (local cache, SubnetCore is source of truth)
@@ -81,12 +81,8 @@ class WorkerManager:
             logger.warning("Max workers limit reached")
             return None
 
-        # BeamCore: workers self-register via POST /workers/register and
-        # own their worker_id end-to-end. The orchestrator no longer
-        # forwards a registration request; it just resolves the worker_id by
-        # looking it up locally (worker_id == hotkey for affiliation).
-        # The canonical worker record lives in BeamCore and can be fetched
-        # via GET /orchestrators/workers when needed.
+        # BeamCore worker registration owns worker identity.
+        # The orchestrator keeps local worker session state for dispatch.
         worker_id = hotkey
         if subnet_core_client is None:
             logger.debug(
@@ -190,7 +186,7 @@ class WorkerManager:
                 logger.warning(f"Worker {worker_id} suspended due to verification error")
 
     async def _verify_connectivity(self, worker) -> bool:
-        """Verify worker endpoint is reachable."""
+        """Verify worker gateway is reachable."""
         try:
             url = f"http://{worker.ip}:{worker.port}/health"
             async with aiohttp.ClientSession() as session:
@@ -356,8 +352,69 @@ class WorkerManager:
         logger.info(f"Worker deregistered: {worker_id}")
         return True
 
+    def get_worker(self, worker_id: str) -> Optional[Any]:
+        """Get worker by ID."""
+        return self.workers.get(worker_id)
+
+    async def get_available_workers(
+        self,
+        region: Optional[str] = None,
+        min_bandwidth: float = 0.0,
+    ) -> List[Any]:
+        """Get available workers from local cache (kept live by push events + periodic sync)."""
+        workers = [
+            w for w in self.workers.values() if w.is_available and w.bandwidth_mbps >= min_bandwidth
+        ]
+        if region:
+            workers = [w for w in workers if w.region == region]
+        logger.debug(f"get_available_workers: {len(workers)} active workers in local cache")
+        return workers
+
+    async def handle_worker_update(self, worker_id: str, event: str) -> None:
+        """Handle a worker connection update and refresh local dispatch state."""
+        from .orchestrator import Worker, WorkerStatus
+
+        if event == "connected":
+            if worker_id not in self.workers:
+                # Add minimal skeleton; sync_workers_from_subnetcore() will fill details
+                worker = Worker(
+                    worker_id=worker_id,
+                    hotkey="",
+                    ip="0.0.0.0",
+                    port=0,
+                    region="unknown",
+                    bandwidth_mbps=0.0,
+                    status=WorkerStatus.ACTIVE,
+                )
+                self.workers[worker_id] = worker
+                logger.info(f"Worker {worker_id[:20]}... added to local cache (push: connected)")
+            else:
+                # Reactivate if previously offline
+                existing = self.workers[worker_id]
+                if existing.status != WorkerStatus.ACTIVE:
+                    existing.status = WorkerStatus.ACTIVE
+                    existing.last_seen = datetime.utcnow()
+                    logger.info(
+                        f"Worker {worker_id[:20]}... reactivated in local cache (push: connected)"
+                    )
+
+        elif event == "disconnected":
+            worker = self.workers.get(worker_id)
+            if worker:
+                worker.status = WorkerStatus.OFFLINE
+                logger.info(
+                    f"Worker {worker_id[:20]}... marked offline in local cache (push: disconnected)"
+                )
+
     def apply_gateway_worker_row(self, row: dict) -> None:
-        """Apply a full worker row from dedicated gateway (after transfer / stats_snapshot)."""
+        """Apply a worker stats row pushed by a dedicated worker gateway.
+
+        Called from WorkerGatewayClient's stats handler on worker_connected /
+        worker_stats_update events so dashboards and scoring reflect
+        gateway-connected workers in real time (the gateway is the source of
+        truth for these workers; BeamCore's push-based handle_worker_update
+        does not know about them).
+        """
         from .orchestrator import Worker, WorkerStatus
 
         worker_id = (row.get("worker_id") or "").strip()
@@ -399,95 +456,8 @@ class WorkerManager:
 
         if row.get("status") == "active" or row.get("connected"):
             worker.status = WorkerStatus.ACTIVE
-
-    async def apply_worker_stats_snapshot(
-        self,
-        worker_id: str,
-        bandwidth_mbps: float,
-        active_tasks: int,
-        bytes_relayed: int = 0,
-    ) -> bool:
-        """Apply a worker stats snapshot to the local orchestrator cache."""
-        from .orchestrator import WorkerStatus
-
-        worker = self.workers.get(worker_id)
-        if not worker:
-            return False
-
-        worker.last_seen = datetime.utcnow()
-        worker.bandwidth_mbps = bandwidth_mbps
-        worker.update_bandwidth_ema(bandwidth_mbps)
-        worker.active_tasks = active_tasks
-
-        if bytes_relayed > 0:
-            worker.bytes_relayed_total += bytes_relayed
-            worker.bytes_relayed_epoch += bytes_relayed
-
-        if worker.status == WorkerStatus.OFFLINE:
-            worker.status = WorkerStatus.ACTIVE
-            logger.info(f"Worker {worker_id} reconnected")
-
-        return True
-
-    def get_worker(self, worker_id: str) -> Optional[Any]:
-        """Get worker by ID."""
-        return self.workers.get(worker_id)
-
-    async def get_available_workers(
-        self,
-        region: Optional[str] = None,
-        min_bandwidth: float = 0.0,
-    ) -> List[Any]:
-        """Get available workers from local cache (kept live by push events + periodic sync)."""
-        workers = [
-            w for w in self.workers.values() if w.is_available and w.bandwidth_mbps >= min_bandwidth
-        ]
-        if region:
-            workers = [w for w in workers if w.region == region]
-        logger.debug(f"get_available_workers: {len(workers)} active workers in local cache")
-        return workers
-
-    async def handle_worker_update(self, worker_id: str, event: str) -> None:
-        """
-        Handle a worker_update push event from SubnetCore WebSocket.
-
-        Called when SubnetCore pushes a worker connect/disconnect event.
-        Updates local cache immediately so task dispatch reflects real-time state
-        without polling GET /orchestrators/workers.
-        """
-        from .orchestrator import Worker, WorkerStatus
-
-        if event == "connected":
-            if worker_id not in self.workers:
-                # Add minimal skeleton; sync_workers_from_subnetcore() will fill details
-                worker = Worker(
-                    worker_id=worker_id,
-                    hotkey="",
-                    ip="0.0.0.0",
-                    port=0,
-                    region="unknown",
-                    bandwidth_mbps=0.0,
-                    status=WorkerStatus.ACTIVE,
-                )
-                self.workers[worker_id] = worker
-                logger.info(f"Worker {worker_id[:20]}... added to local cache (push: connected)")
-            else:
-                # Reactivate if previously offline
-                existing = self.workers[worker_id]
-                if existing.status != WorkerStatus.ACTIVE:
-                    existing.status = WorkerStatus.ACTIVE
-                    existing.last_seen = datetime.utcnow()
-                    logger.info(
-                        f"Worker {worker_id[:20]}... reactivated in local cache (push: connected)"
-                    )
-
-        elif event == "disconnected":
-            worker = self.workers.get(worker_id)
-            if worker:
-                worker.status = WorkerStatus.OFFLINE
-                logger.info(
-                    f"Worker {worker_id[:20]}... marked offline in local cache (push: disconnected)"
-                )
+        elif row.get("status") == "offline" or row.get("connected") is False:
+            worker.status = WorkerStatus.OFFLINE
 
     def register_worker_connection(self, worker_id: str, websocket: Any) -> None:
         """Register a worker's WebSocket connection."""
@@ -538,125 +508,10 @@ class WorkerManager:
 
     async def sync_workers_from_subnetcore(self) -> int:
         """
-        Sync workers from SubnetCore.
-
-        Discovers affiliated workers from SubnetCore and updates the local cache.
-        Returns the number of workers synced.
-
-        SubnetCore returns anonymous worker data (no hotkey/ip/port/region for privacy):
-        - worker_id: Worker identifier
-        - status: Worker status
-        - bandwidth_mbps: Current bandwidth from the latest worker stats snapshot
-        - success_rate: Task success rate
-        - trust_score: Trust score
-        - total_tasks: Total tasks completed
-        - bytes_relayed_total: Total bytes transferred
-        - last_seen: Last telemetry or session activity time
+        Keep the local worker cache as the source of truth.
         """
-        from .orchestrator import Worker, WorkerStatus
-
-        subnet_core_client = self._get_subnet_core_client()
-        if not subnet_core_client:
-            logger.warning("Cannot sync workers: SubnetCore client not available")
-            return 0
-
-        try:
-            # Dedicated-only policy: when a dedicated worker gateway is configured,
-            # do NOT sync from BeamCore public worker pool.
-            if getattr(subnet_core_client, "uses_dedicated_worker_gateway", lambda: False)():
-                gateway = getattr(subnet_core_client, "_worker_gateway", None)
-                gw_client = getattr(gateway, "_client", None) if gateway else None
-                if not gw_client:
-                    logger.warning(
-                        "Dedicated gateway enabled but control session not ready; no workers synced"
-                    )
-                    return 0
-                workers_list = await gw_client.list_workers(timeout=30.0)
-            else:
-                logger.warning(
-                    "Public worker gateway removed by BeamCore — configure dedicated worker gateway"
-                )
-                return 0
-
-            if not workers_list:
-                logger.info("No workers returned from worker sync source")
-                return 0
-
-            # Track seen worker IDs so we can mark missing ones offline for dedicated pools.
-            seen_worker_ids: set[str] = set()
-
-            synced = 0
-            for w in workers_list:
-                worker_id = w.get("worker_id", "")
-                if not worker_id:
-                    continue
-                seen_worker_ids.add(worker_id)
-
-                # Update or create worker in local cache
-                if worker_id in self.workers:
-                    # Update existing worker with performance metrics
-                    existing = self.workers[worker_id]
-                    existing.bandwidth_mbps = w.get("bandwidth_mbps", existing.bandwidth_mbps)
-                    existing.trust_score = w.get("trust_score", existing.trust_score)
-                    existing.success_rate = w.get("success_rate", existing.success_rate)
-                    existing.total_tasks = w.get("total_tasks", existing.total_tasks)
-                    existing.bytes_relayed_total = w.get(
-                        "bytes_relayed_total",
-                        w.get("bytes_relayed", existing.bytes_relayed_total),
-                    )
-                    existing.global_pending_tasks = w.get(
-                        "pending_tasks", 0
-                    )  # Global task count from BeamCore
-                    existing.last_seen = datetime.utcnow()
-                    if existing.status == WorkerStatus.OFFLINE:
-                        existing.status = WorkerStatus.ACTIVE
-                else:
-                    # Add new worker to cache (anonymous - no hotkey/ip/port/region)
-                    worker = Worker(
-                        worker_id=worker_id,
-                        hotkey="",  # Anonymous - not provided by SubnetCore
-                        ip="0.0.0.0",  # Anonymous
-                        port=0,  # Anonymous
-                        region="unknown",  # Anonymous
-                        bandwidth_mbps=w.get("bandwidth_mbps", 0.0),
-                        status=WorkerStatus.ACTIVE,
-                        trust_score=w.get("trust_score", 0.5),
-                        success_rate=w.get("success_rate", 1.0),
-                        total_tasks=w.get("total_tasks", 0),
-                        bytes_relayed_total=w.get(
-                            "bytes_relayed_total", w.get("bytes_relayed", 0)
-                        ),
-                        global_pending_tasks=w.get(
-                            "pending_tasks", 0
-                        ),  # Global task count from BeamCore
-                    )
-                    self.workers[worker_id] = worker
-                    # No hotkey/region indexing since anonymous
-
-                synced += 1
-
-            # Dedicated pools: mark workers missing from gateway as offline.
-            if getattr(subnet_core_client, "uses_dedicated_worker_gateway", lambda: False)():
-                for worker_id, worker in self.workers.items():
-                    if worker_id not in seen_worker_ids and worker.status == WorkerStatus.ACTIVE:
-                        worker.status = WorkerStatus.OFFLINE
-
-            sync_source = (
-                "dedicated gateway"
-                if getattr(subnet_core_client, "uses_dedicated_worker_gateway", lambda: False)()
-                else "BeamCore public pool"
-            )
-            logger.info(
-                "Synced %s workers from %s (total in cache: %s)",
-                synced,
-                sync_source,
-                len(self.workers),
-            )
-            return synced
-
-        except Exception as e:
-            logger.error("Failed to sync workers from SubnetCore: %r", e)
-            return 0
+        logger.debug("Worker cache sync uses local worker registrations only")
+        return 0
 
     async def worker_sync_loop(self, running_flag, interval_seconds: int = 60) -> None:
         """Background loop for syncing workers from SubnetCore."""

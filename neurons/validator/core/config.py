@@ -74,7 +74,7 @@ class Settings(BaseSettings):
     # Weight Setting
     # ==========================================================================
 
-    # Override via BEAM_VALIDATOR_BLOCKS_BETWEEN_WEIGHTS env var (e.g., =360 for testnet ~100s/block)
+    # Override via BEAM_VALIDATOR_BLOCKS_BETWEEN_WEIGHTS env var.
     blocks_between_weights: int = 100  # ~20 minutes on mainnet
     weight_alpha: float = 0.3  # EMA smoothing factor
 
@@ -93,8 +93,6 @@ class Settings(BaseSettings):
 
     # BeamCore HTTP base URL for score submission
     core_server_url: str = "https://beamcore.b1m.ai"
-    # Required for PoB routes (requireAuth). Validator routes use hotkey signatures only.
-    subnet_core_api_key: Optional[str] = None
 
     # ==========================================================================
     # Redis (for caching, optional)
@@ -122,6 +120,8 @@ class Settings(BaseSettings):
     # ==========================================================================
 
     sync_interval: int = 12  # Metagraph sync interval (match tempo)
+    heartbeat_interval_seconds: int = 60  # BeamCore heartbeat interval
+    disable_weight_set: bool = False  # Operator guard: skip on-chain set_weights
     job_timeout_seconds: int = 60  # Task completion timeout
 
     # ==========================================================================
@@ -136,20 +136,7 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Get cached settings instance"""
     import os
-    from pathlib import Path
 
-    # Load .env file so LOCAL_MODE is available via os.getenv
-    env_file = Path(".env")
-    if env_file.exists():
-        try:
-            from dotenv import load_dotenv
-            load_dotenv(env_file, override=False)
-        except ImportError:
-            pass
-
-    # Accept LOCAL_MODE (no prefix) or BEAM_VALIDATOR_LOCAL_MODE
-    local_mode = (
-        os.getenv("LOCAL_MODE", "").lower() in ("true", "1", "yes")
-        or os.getenv("BEAM_VALIDATOR_LOCAL_MODE", "").lower() in ("true", "1", "yes")
-    )
+    # Check for LOCAL_MODE without prefix (for consistency with orchestrator)
+    local_mode = os.getenv("LOCAL_MODE", "").lower() in ("true", "1", "yes")
     return Settings(local_mode=local_mode)

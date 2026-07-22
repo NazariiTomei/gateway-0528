@@ -44,7 +44,7 @@ import time
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version as package_version
 from typing import Any, Dict, Optional
-from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 
 import httpx
 
@@ -85,7 +85,7 @@ def resolve_worker_version() -> str:
     try:
         return package_version("beam")
     except PackageNotFoundError:
-        return "0.2.0"
+        return "0.2.1"
 
 
 def parse_strict_semver(value: str) -> Optional[tuple[int, int, int]]:
@@ -107,7 +107,6 @@ def worker_version_satisfies(minimum_version: str) -> bool:
     minimum = parse_strict_semver(minimum_version)
     return bool(current and minimum and current >= minimum)
 
-
 WORKER_VERSION = resolve_worker_version()
 
 # WebSocket settings
@@ -120,37 +119,29 @@ WS_MAX_RECONNECT_ATTEMPTS = (
 )
 
 WS_PING_INTERVAL = 25  # seconds
+WS_PING_TIMEOUT = float(
+    os.environ.get("WORKER_WS_PING_TIMEOUT", os.environ.get("WS_PING_TIMEOUT", "120"))
+)
 
 # Transfer settings
-DEFAULT_CHUNK_SIZE_BYTES = 4 * 1024 * 1024
-MAX_CONCURRENT_TASKS = max(1, int(os.environ.get("WORKER_MAX_CONCURRENT_TASKS", "4")))
-MAX_QUEUED_WS_TASKS = max(
-    1, int(os.environ.get("WORKER_MAX_QUEUED_WS_TASKS", str(MAX_CONCURRENT_TASKS)))
-)
-MAX_IN_FLIGHT_BYTES = max(
-    DEFAULT_CHUNK_SIZE_BYTES,
-    int(os.environ.get("WORKER_MAX_IN_FLIGHT_BYTES", str(256 * 1024 * 1024))),
-)
 FETCH_TIMEOUT = 30  # seconds
 SEND_TIMEOUT = 30  # seconds
 MAX_RETRIES = 3
 RETRY_BACKOFF = 1.0  # Base backoff in seconds
 FETCH_STREAM_CHUNK_SIZE = 64 * 1024
 WS_TASK_RESULT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_RESULT_ACK_TIMEOUT", "3.0"))
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None or not str(raw).strip():
-        return default
-    return str(raw).strip().lower() in ("1", "true", "yes")
-
-
-# Participant workers default to recording a payment obligation unless opted out.
-WORKER_REQUIRED_PAYMENT = _env_bool("WORKER_REQUIRED_PAYMENT", False)
-
-# Global semaphore for task concurrency
-task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+WS_TASK_RESULT_SEND_ATTEMPTS = max(3, int(os.environ.get("WORKER_TASK_RESULT_SEND_ATTEMPTS", "8")))
+WS_TASK_RESULT_RECONNECT_WAIT_SECONDS = max(0.0, float(os.environ.get("WORKER_TASK_RESULT_RECONNECT_WAIT_SECONDS", "2.0")))
+TASK_RESULT_ACK_STATUSES = {
+    "owned_processing",
+    "completed",
+    "failed",
+    "late_superseded",
+    "late_expired",
+    "retry",
+    "rejected",
+}
+TASK_RESULT_TERMINAL_STATUSES = TASK_RESULT_ACK_STATUSES - {"retry"}
 
 
 @dataclass
@@ -169,13 +160,11 @@ class WorkerState:
     ws_connected: bool = False
     ws_reconnect_attempts: int = 0
     use_websocket: bool = True
-    pending_task_accepts: Dict[str, asyncio.Future] = field(default_factory=dict)
     pending_task_results: Dict[str, asyncio.Future] = field(default_factory=dict)
     active_ws_task_ids: set[str] = field(default_factory=set)
-    ws_task_handles: set[asyncio.Task] = field(default_factory=set)
-    reserved_ws_slots: int = 0
-    reserved_bytes: int = 0
-    ws_send_lock: Optional[asyncio.Lock] = None
+    ws_offer_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    ws_executor_task: Optional[asyncio.Task] = None
+    active_websocket: Optional[Any] = None
 
 
 @dataclass
@@ -192,10 +181,10 @@ class TaskExecutionResult:
 
 @dataclass
 class TaskSummaryAck:
-    """BeamCore task_result_ack fields used for payment gating."""
+    """BeamCore task_result_ack ownership fields used by the worker runtime."""
 
     received: bool = False
-    completed: bool = False
+    status: Optional[str] = None
     reason: Optional[str] = None
 
 
@@ -354,9 +343,6 @@ def build_transfer_context(task: dict) -> tuple[Optional[dict], Optional[str]]:
     if minimum_worker_version and not worker_version_satisfies(minimum_worker_version):
         return None, "unsupported_worker_version"
     signed_url_flow = str(task.get("signed_url_flow") or "").strip()
-    if signed_url_flow == "signed_url_v1" and is_object_storage_presigned_url(dest_url):
-        if not (dest_headers.get("Content-MD5") or dest_headers.get("content-md5")):
-            return None, "missing_content_md5"
     try:
         parsed_range = parse_offer_range(source_headers)
     except ValueError as exc:
@@ -407,19 +393,18 @@ async def execute_task_with_metrics(
     etag: Optional[str] = None
 
     try:
-        async with task_semaphore:
-            remaining_sec = remaining_deadline_seconds(deadline_us)
-            if remaining_sec is not None and remaining_sec < 2:
-                error_msg = f"Deadline expired while waiting ({remaining_sec:.1f}s)"
-                print(f"{log_prefix} {error_msg}")
-            else:
-                bytes_transferred, success, error_msg, chunk_hash, etag = await execute_transfer(
-                    state,
-                    task_id,
-                    transfer_context,
-                    task,
-                    deadline_us,
-                )
+        remaining_sec = remaining_deadline_seconds(deadline_us)
+        if remaining_sec is not None and remaining_sec < 2:
+            error_msg = f"Deadline expired while waiting ({remaining_sec:.1f}s)"
+            print(f"{log_prefix} {error_msg}")
+        else:
+            bytes_transferred, success, error_msg, chunk_hash, etag = await execute_transfer(
+                state,
+                task_id,
+                transfer_context,
+                task,
+                deadline_us,
+            )
     except Exception as e:
         error_msg = str(e)
         print(f"{log_prefix} Task error: {e}")
@@ -477,90 +462,6 @@ def sign_message(wallet: Any, message: str) -> str:
     return "0x" + signature.hex()
 
 
-def payment_evidence_message(
-    worker_id: str,
-    task_id: str,
-    offer_id: str,
-    chunk_hash: str = "",
-) -> str:
-    """Canonical message BeamCore verifies for worker payment evidence."""
-    return ":".join(
-        [
-            "beam-worker-payment-evidence",
-            worker_id,
-            task_id,
-            offer_id,
-            chunk_hash or "",
-        ]
-    )
-
-
-async def submit_worker_payment_evidence(
-    state: WorkerState,
-    task_id: str,
-    offer_id: str,
-    chunk_hash: str = "",
-) -> bool:
-    """Submit durable worker-signed payment evidence directly to BeamCore HTTP."""
-    if not state.worker_id or not state.api_key:
-        print("[Worker] Payment evidence skipped: missing worker_id or api_key")
-        return False
-
-    effective_offer = (offer_id or "").strip()
-    if not effective_offer:
-        print(
-            "[Worker] Payment evidence skipped: missing offer_id "
-            f"(task={task_label(task_id)}) — never substitute task_id for attempt UUID"
-        )
-        return False
-
-    message = payment_evidence_message(
-        state.worker_id,
-        task_id,
-        effective_offer,
-        chunk_hash,
-    )
-    try:
-        worker_signature = sign_message(state.wallet, message)
-    except Exception as e:
-        print(f"[Worker] Payment evidence signing failed: {e}")
-        return False
-
-    payload = {
-        "offer_id": effective_offer,
-        "success": True,
-        "chunk_hash": chunk_hash or "",
-        "worker_signature": worker_signature,
-        "required_payment": WORKER_REQUIRED_PAYMENT,
-    }
-    url = f"{state.api_url.rstrip('/')}/workers/{state.worker_id}/tasks/{task_id}/payment-evidence"
-
-    for attempt in range(3):
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(url, json=payload, headers=api_key_headers(state))
-            if 200 <= response.status_code < 300:
-                print(
-                    f"[Worker] Payment evidence OK task={task_label(task_id)} "
-                    f"offer={task_label(effective_offer)}"
-                )
-                return True
-            print(
-                f"[Worker] Payment evidence rejected attempt={attempt + 1}/3 "
-                f"status={response.status_code} task={task_label(task_id)} "
-                f"offer={task_label(effective_offer)}"
-            )
-        except Exception as e:
-            print(f"[Worker] Payment evidence submit error attempt={attempt + 1}/3: {e}")
-        await asyncio.sleep(1 + attempt)
-
-    print(
-        f"[Worker] Payment evidence FAILED after retries task_id={task_id} "
-        f"offer_id={effective_offer} worker_id={state.worker_id}"
-    )
-    return False
-
-
 async def register_worker(client: httpx.AsyncClient, state: WorkerState) -> Dict[str, Any]:
     """Register as a worker with SubnetCore.
 
@@ -571,8 +472,6 @@ async def register_worker(client: httpx.AsyncClient, state: WorkerState) -> Dict
     ip = await get_public_ip()
     port = 9000
 
-    # Generate a payment pubkey
-    payment_pubkey = hashlib.sha256(f"payment:{hotkey}".encode()).hexdigest()
 
     # Sign the registration message: "{hotkey}:{ip}:{port}"
     message = f"{hotkey}:{ip}:{port}"
@@ -588,7 +487,6 @@ async def register_worker(client: httpx.AsyncClient, state: WorkerState) -> Dict
         "port": port,
         "claimed_bandwidth_mbps": 100,
         "coldkey": wallet.coldkeypub.ss58_address if wallet.coldkeypub else hotkey,
-        "payment_pubkey": payment_pubkey,
         "signature": signature,
     }
 
@@ -727,71 +625,13 @@ def is_canary_destination(url: str) -> bool:
     return url.startswith(("null://", "canary://", "skip://"))
 
 
-def estimate_task_bytes(task: dict) -> int:
-    """Estimate how many bytes this task can hold in memory."""
-    raw_chunk_size = task.get("chunk_size") or DEFAULT_CHUNK_SIZE_BYTES
-
-    try:
-        chunk_size = max(1, int(raw_chunk_size))
-    except (TypeError, ValueError):
-        chunk_size = DEFAULT_CHUNK_SIZE_BYTES
-
-    return chunk_size
-
-
-async def ws_send_task_reject(
-    websocket,
-    state: WorkerState,
-    task_id: str,
-    reason: str,
-    offer_id: str = None,
-) -> bool:
-    """Reject a WebSocket task offer so BeamCore can reassign it quickly."""
-    try:
-        msg = {
-            "type": "task_reject",
-            "offer_id": offer_id or task_id,
-            "task_id": task_id,
-            "worker_id": state.worker_id,
-            "reason": reason,
-        }
-        await ws_send_json(websocket, state, msg)
-        return True
-    except Exception as e:
-        print(f"[Worker] WS task_reject error: {e}")
+def claim_ws_task(state: WorkerState, task_id: str) -> bool:
+    """Claim an offered attempt locally so duplicate deliveries share one execution."""
+    if task_id in state.active_ws_task_ids:
         return False
 
-
-def try_reserve_ws_capacity(
-    state: WorkerState, task_id: str, estimated_bytes: int
-) -> Optional[str]:
-    """Reserve local capacity for a pushed task before accepting it."""
-    if task_id in state.active_ws_task_ids:
-        return "duplicate"
-
-    if estimated_bytes > MAX_IN_FLIGHT_BYTES:
-        return f"task_too_large:{estimated_bytes}"
-
-    if state.reserved_ws_slots >= MAX_QUEUED_WS_TASKS:
-        return f"queue_full:{state.reserved_ws_slots}"
-
-    if state.reserved_bytes + estimated_bytes > MAX_IN_FLIGHT_BYTES:
-        return f"memory_budget:{state.reserved_bytes + estimated_bytes}"
-
     state.active_ws_task_ids.add(task_id)
-    state.reserved_ws_slots += 1
-    state.reserved_bytes += estimated_bytes
-    return None
-
-
-def release_ws_capacity(
-    state: WorkerState, task_id: str, estimated_bytes: int, reserved: bool
-) -> None:
-    """Release capacity reserved for a pushed task."""
-    if reserved:
-        state.reserved_ws_slots = max(0, state.reserved_ws_slots - 1)
-        state.reserved_bytes = max(0, state.reserved_bytes - max(0, estimated_bytes))
-    state.active_ws_task_ids.discard(task_id)
+    return True
 
 
 async def send_chunk(
@@ -1078,7 +918,12 @@ def get_ws_url(
     hotkey: Optional[str] = None,
     region: Optional[str] = None,
 ) -> str:
-    """Convert worker gateway URL to the worker WebSocket URL."""
+    """Convert worker gateway URL to the worker WebSocket URL.
+
+    hotkey/region are optional metadata a dedicated worker gateway (see
+    docs/dedicated-worker-gateway.md) stores on connect for its own worker
+    listing/scoring; a public BeamCore-hosted gateway ignores unknown params.
+    """
     base = gateway_url.rstrip("/")
     if base.startswith("https://"):
         ws_base = "wss://" + base[8:]
@@ -1087,15 +932,15 @@ def get_ws_url(
     else:
         ws_base = "ws://" + base
     url = f"{ws_base}/ws/{worker_id}"
-    params: dict[str, str] = {}
+    params = []
     if api_key:
-        params["api_key"] = api_key
+        params.append(f"api_key={quote(api_key)}")
     if hotkey:
-        params["hotkey"] = hotkey
+        params.append(f"hotkey={quote(hotkey)}")
     if region:
-        params["region"] = region
+        params.append(f"region={quote(region)}")
     if params:
-        url = f"{url}?{urlencode(params)}"
+        url = f"{url}?{'&'.join(params)}"
     return url
 
 
@@ -1120,23 +965,21 @@ def get_ws_status_code(exc: Exception) -> Optional[int]:
     return None
 
 
-async def ws_send_task_accept(
-    websocket, state: WorkerState, task_id: str, offer_id: str = None
-) -> bool:
-    """Send task acceptance over WebSocket."""
-    try:
-        msg = {
-            "type": "task_accept",
-            "offer_id": offer_id or task_id,
-            "task_id": task_id,
-            "worker_id": state.worker_id,
-            "worker_version": WORKER_VERSION,
-        }
-        await ws_send_json(websocket, state, msg)
-        return True
-    except Exception as e:
-        print(f"[Worker] WS task_accept error: {e}")
-        return False
+async def wait_for_result_websocket(state: WorkerState, fallback):
+    """Return the current worker-gateway socket, waiting briefly across reconnects."""
+    if state.active_websocket is not None:
+        return state.active_websocket
+    if state.ws_connected and fallback is not None:
+        return fallback
+    if WS_TASK_RESULT_RECONNECT_WAIT_SECONDS <= 0:
+        return fallback
+
+    deadline = time.monotonic() + WS_TASK_RESULT_RECONNECT_WAIT_SECONDS
+    while state.running and time.monotonic() < deadline:
+        if state.active_websocket is not None:
+            return state.active_websocket
+        await asyncio.sleep(0.1)
+    return state.active_websocket or fallback
 
 
 async def ws_send_task_result(
@@ -1145,6 +988,7 @@ async def ws_send_task_result(
     task_id: str,
     success: bool,
     bytes_transferred: int,
+    duration_ms: Optional[float] = None,
     chunk_hash: str = "",
     etag: str = None,
     error: str = None,
@@ -1158,14 +1002,17 @@ async def ws_send_task_result(
             "offer_id": offer_id or task_id,
             "worker_id": state.worker_id,
             "success": success,
+            "bytes_transferred": bytes_transferred,
         }
+        if duration_ms is not None:
+            msg["duration_ms"] = duration_ms
         if chunk_hash:
             msg["chunk_hash"] = chunk_hash
         if etag:
             msg["etag"] = etag
         if error:
             msg["error"] = error
-        await ws_send_json(websocket, state, msg)
+        await websocket.send(json.dumps(msg))
         return True
     except Exception as e:
         print(f"[Worker] WS task_result error: {e}")
@@ -1178,55 +1025,57 @@ async def finalize_ws_task_result(
     task_id: str,
     success: bool,
     bytes_transferred: int,
+    duration_ms: Optional[float] = None,
     chunk_hash: str = "",
     etag: str = None,
     error: str = None,
     offer_id: str = None,
 ) -> TaskSummaryAck:
-    """Send task_result and wait for BeamCore ack (received / completed)."""
+    """Send task_result until BeamCore assumes or rejects relay ownership."""
     result_key = offer_id or task_id
     empty = TaskSummaryAck()
 
-    for attempt in range(3):
+    for attempt in range(WS_TASK_RESULT_SEND_ATTEMPTS):
         ack_future: asyncio.Future = asyncio.get_event_loop().create_future()
         state.pending_task_results[result_key] = ack_future
 
         try:
+            send_websocket = await wait_for_result_websocket(state, websocket)
             sent = await ws_send_task_result(
-                websocket,
+                send_websocket,
                 state,
                 task_id,
                 success,
                 bytes_transferred,
+                duration_ms=duration_ms,
                 chunk_hash=chunk_hash,
                 etag=etag,
                 error=error,
                 offer_id=offer_id,
             )
             if not sent:
+                if attempt < WS_TASK_RESULT_SEND_ATTEMPTS - 1:
+                    await asyncio.sleep(min(WS_TASK_RESULT_RECONNECT_WAIT_SECONDS, 0.25 * (attempt + 1)))
                 continue
 
             try:
                 ack = await asyncio.wait_for(ack_future, timeout=WS_TASK_RESULT_ACK_TIMEOUT)
-                if ack.completed:
+                if ack.status in TASK_RESULT_TERMINAL_STATUSES:
                     print(
-                        f"[Worker] [WS] Task completed on BeamCore: {task_label(task_id)} offer={task_label(offer_id)}"
-                    )
-                    return ack
-                if ack.received:
-                    reason = ack.reason or "not_completed"
-                    print(
-                        f"[Worker] [WS] Task result received but not completed: "
-                        f"task={task_label(task_id)} offer={task_label(offer_id)} reason={reason}"
+                        f"[Worker] [WS] Task result settled by BeamCore: "
+                        f"task={task_label(task_id)} offer={task_label(offer_id)} "
+                        f"status={ack.status or 'unknown'}"
                     )
                     return ack
                 print(
-                    f"[Worker] [WS] Task result nack from gateway: {task_label(task_id)} offer={task_label(offer_id)}"
+                    f"[Worker] [WS] Task result relay not terminal: "
+                    f"task={task_label(task_id)} offer={task_label(offer_id)} "
+                    f"status={ack.status or 'invalid'} reason={ack.reason or 'retry'}"
                 )
             except asyncio.TimeoutError:
                 print(
                     f"[Worker] [WS] Task result ack timeout "
-                    f"attempt={attempt + 1}/3 task={task_label(task_id)} offer={task_label(offer_id)}"
+                    f"attempt={attempt + 1}/{WS_TASK_RESULT_SEND_ATTEMPTS} task={task_label(task_id)} offer={task_label(offer_id)}"
                 )
         finally:
             state.pending_task_results.pop(result_key, None)
@@ -1237,30 +1086,48 @@ async def finalize_ws_task_result(
     return empty
 
 
-async def ws_send_json(websocket, state: WorkerState, payload: dict) -> None:
-    """Serialize worker websocket sends to avoid concurrent-send races."""
-    if state.ws_send_lock is None:
-        state.ws_send_lock = asyncio.Lock()
+def enqueue_ws_task(state: WorkerState, websocket, task: dict) -> None:
+    """Queue one offered attempt for the worker's singular FIFO executor."""
+    task_id = task.get("task_id") or task.get("offer_id")
+    offer_id = task.get("offer_id") or task_id
+    task_key = offer_id or task_id
+    if not task_id:
+        print("[Worker] [WS] Skipping task: missing task_id")
+        return
+    if not claim_ws_task(state, task_key):
+        print(
+            f"[Worker] [WS] Duplicate task offer ignored: {task_label(task_id)} offer={task_label(offer_id)}"
+        )
+        return
 
-    async with state.ws_send_lock:
-        await websocket.send(json.dumps(payload))
+    state.ws_offer_queue.put_nowait((websocket, task))
+    print(
+        f"[Worker] [WS] Task queued: {task_label(task_id)} offer={task_label(offer_id)} "
+        f"queue_depth={state.ws_offer_queue.qsize()}"
+    )
 
 
-def track_ws_task(state: WorkerState, coro: asyncio.coroutines) -> None:
-    """Track spawned WS task handlers so they are not dropped on loop exit."""
-    task = asyncio.create_task(coro)
-    state.ws_task_handles.add(task)
-
-    def _on_done(done_task: asyncio.Task) -> None:
-        state.ws_task_handles.discard(done_task)
+async def ws_task_executor(state: WorkerState) -> None:
+    """Execute queued offers one at a time, in arrival order."""
+    while True:
+        item = await state.ws_offer_queue.get()
         try:
-            exc = done_task.exception()
+            if item is None:
+                return
+            websocket, task = item
+            await handle_ws_task(state, websocket, task)
         except asyncio.CancelledError:
-            return
-        if exc is not None:
-            print(f"[Worker] [WS] Task handler crashed: {type(exc).__name__}: {exc}")
-
-    task.add_done_callback(_on_done)
+            raise
+        except Exception as exc:
+            task_id = task.get("task_id") or task.get("offer_id")
+            offer_id = task.get("offer_id") or task_id
+            print(
+                f"[Worker] [WS] Sequential task executor error: "
+                f"task={task_label(task_id)} offer={task_label(offer_id)} "
+                f"error={type(exc).__name__}: {exc}"
+            )
+        finally:
+            state.ws_offer_queue.task_done()
 
 
 async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
@@ -1269,70 +1136,43 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
     offer_id = task.get("offer_id") or task_id
     task_key = offer_id or task_id
     deadline_us = task.get("deadline_us", 0)
-    transfer_context, validation_error = build_transfer_context(task)
-    estimated_bytes = estimate_task_bytes(task)
-    reserved_capacity = False
 
     print(f"[Worker] [WS] Task: {task_label(task_id)} offer={task_label(offer_id)}...")
-    if not task_id:
-        print("[Worker] [WS] Skipping task: missing task_id")
-        return False
-    if validation_error or transfer_context is None:
-        reason = (
-            validation_error
-            if validation_error == "unsupported_worker_version"
-            else f"invalid_offer:{validation_error or 'unknown'}"
-        )
-        await ws_send_task_reject(websocket, state, task_id, reason, offer_id=offer_id)
-        print(
-            f"[Worker] [WS] Rejected task {task_label(task_id)} offer={task_label(offer_id)}: "
-            f"{reason}"
-        )
-        return False
-
-    capacity_error = try_reserve_ws_capacity(state, task_key, estimated_bytes)
-    if capacity_error == "duplicate":
-        print(
-            f"[Worker] [WS] Duplicate task offer ignored: {task_label(task_id)} offer={task_label(offer_id)}"
-        )
-        return False
-    if capacity_error:
-        await ws_send_task_reject(websocket, state, task_id, capacity_error, offer_id=offer_id)
-        print(
-            f"[Worker] [WS] Rejected task {task_label(task_id)} offer={task_label(offer_id)} "
-            f"due to capacity guard: {capacity_error} (budget={MAX_IN_FLIGHT_BYTES} bytes)"
-        )
-        return False
-    reserved_capacity = True
 
     try:
+        transfer_context, validation_error = build_transfer_context(task)
+        if validation_error or transfer_context is None:
+            reason = validation_error if validation_error == "unsupported_worker_version" else f"invalid_offer:{validation_error or 'unknown'}"
+            await finalize_ws_task_result(
+                websocket,
+                state,
+                task_id,
+                False,
+                0,
+                error=reason,
+                offer_id=offer_id,
+            )
+            print(
+                f"[Worker] [WS] Failed task {task_label(task_id)} offer={task_label(offer_id)}: "
+                f"{reason}"
+            )
+            return False
+
         remaining_sec = remaining_deadline_seconds(deadline_us)
         if remaining_sec is not None and remaining_sec < 5:
-            print(f"[Worker] [WS] Skipping task: deadline too close ({remaining_sec:.1f}s)")
-            return False
-
-        # Register a future to wait for the server's accept ack before executing
-        accept_future: asyncio.Future = asyncio.get_event_loop().create_future()
-        state.pending_task_accepts[task_key] = accept_future
-
-        accepted = await ws_send_task_accept(websocket, state, task_id, offer_id=offer_id)
-        if not accepted:
-            state.pending_task_accepts.pop(task_key, None)
-            print("[Worker] [WS] Failed to send task accept")
-            return False
-
-        # Execute only after BeamCore confirms this exact attempt lease.
-        try:
-            server_accepted = await asyncio.wait_for(accept_future, timeout=5.0)
-            if not server_accepted:
-                print(
-                    f"[Worker] [WS] Task accept rejected by server: task={task_label(task_id)} offer={task_label(offer_id)}"
-                )
-                return False
-        except asyncio.TimeoutError:
-            state.pending_task_accepts.pop(task_key, None)
+            reason = "deadline_too_close"
+            await finalize_ws_task_result(
+                websocket,
+                state,
+                task_id,
+                False,
+                0,
+                error=reason,
+                offer_id=offer_id,
+            )
             print(
-                f"[Worker] [WS] Accept ack timeout, aborting: task={task_label(task_id)} offer={task_label(offer_id)}"
+                f"[Worker] [WS] Failed task {task_label(task_id)} "
+                f"offer={task_label(offer_id)}: {reason} ({remaining_sec:.1f}s)"
             )
             return False
 
@@ -1345,25 +1185,18 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
             log_prefix="[Worker] [WS]",
         )
 
-        summary_ack = await finalize_ws_task_result(
+        await finalize_ws_task_result(
             websocket,
             state,
             task_id,
             result.success,
             result.bytes_transferred,
+            duration_ms=result.duration_ms,
             chunk_hash=result.chunk_hash,
             etag=result.etag,
             error=result.error_msg,
             offer_id=offer_id,
         )
-
-        if result.success and summary_ack.completed:
-            await submit_worker_payment_evidence(
-                state,
-                task_id,
-                offer_id,
-                chunk_hash=result.chunk_hash,
-            )
 
         status = "OK" if result.success else f"FAIL: {result.error_msg}"
         print(
@@ -1373,8 +1206,7 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
 
         return result.success
     finally:
-        state.pending_task_accepts.pop(task_key, None)
-        release_ws_capacity(state, task_key, estimated_bytes, reserved_capacity)
+        state.active_ws_task_ids.discard(task_key)
 
 
 async def websocket_loop(state: WorkerState):
@@ -1389,8 +1221,8 @@ async def websocket_loop(state: WorkerState):
         state.worker_id,
         state.api_key,
         state.worker_gateway_url,
-        hotkey=state.wallet.hotkey.ss58_address if state.wallet else None,
-        region=(os.environ.get("WORKER_REGION") or "").strip() or None,
+        hotkey=getattr(getattr(state.wallet, "hotkey", None), "ss58_address", None),
+        region=os.environ.get("WORKER_REGION"),
     )
     print(f"[Worker] Connecting to WebSocket: {ws_url.split('?')[0]}")
     reconnect_delay = WS_RECONNECT_MIN_DELAY
@@ -1400,10 +1232,11 @@ async def websocket_loop(state: WorkerState):
             async with websockets.connect(
                 ws_url,
                 ping_interval=WS_PING_INTERVAL,
-                ping_timeout=10,
+                ping_timeout=WS_PING_TIMEOUT,
                 close_timeout=5,
             ) as websocket:
                 state.ws_connected = True
+                state.active_websocket = websocket
                 state.ws_reconnect_attempts = 0
                 reconnect_delay = WS_RECONNECT_MIN_DELAY
                 print("[Worker] [WS] Connected!")
@@ -1422,47 +1255,32 @@ async def websocket_loop(state: WorkerState):
                                 print("[Worker] [WS] Server confirmed connection")
 
                             elif msg_type == "task_offer":
-                                track_ws_task(state, handle_ws_task(state, websocket, message))
-
-                            elif msg_type == "task_accept_ack":
-                                ack_task_id = message.get("task_id")
-                                ack_offer_id = message.get("offer_id") or ack_task_id
-                                server_accepted = message.get("accepted", True)
-                                if ack_offer_id and ack_offer_id in state.pending_task_accepts:
-                                    future = state.pending_task_accepts.pop(ack_offer_id)
-                                    if not future.done():
-                                        future.set_result(server_accepted)
-                                if not server_accepted:
-                                    print(
-                                        f"[Worker] [WS] Task accept rejected: "
-                                        f"task={task_label(ack_task_id)} offer={task_label(ack_offer_id)} "
-                                        f"reason={message.get('reason', 'unknown')}"
-                                    )
+                                enqueue_ws_task(state, websocket, message)
 
                             elif msg_type == "task_result_ack":
                                 ack_task_id = message.get("task_id")
                                 ack_offer_id = message.get("offer_id") or ack_task_id
-                                received = bool(message.get("received", False))
-                                completed_raw = message.get("completed")
-                                completed = (
-                                    bool(completed_raw)
-                                    if completed_raw is not None
-                                    else received
-                                )
+                                received_value = message.get("received")
+                                received = received_value if isinstance(received_value, bool) else False
+                                status_value = message.get("status")
+                                status = status_value if isinstance(status_value, str) and status_value in TASK_RESULT_ACK_STATUSES else None
+                                if status is not None and received != (status not in {"retry", "rejected"}):
+                                    status = None
                                 reason = message.get("reason")
                                 ack = TaskSummaryAck(
                                     received=received,
-                                    completed=completed,
+                                    status=status,
                                     reason=str(reason) if reason else None,
                                 )
                                 if ack_offer_id and ack_offer_id in state.pending_task_results:
                                     future = state.pending_task_results.pop(ack_offer_id)
                                     if not future.done():
                                         future.set_result(ack)
-                                if not received:
+                                if status == "rejected":
                                     print(
-                                        f"[Worker] [WS] Gateway rejected task_result: "
-                                        f"task={task_label(ack_task_id)} offer={task_label(ack_offer_id)}"
+                                        f"[Worker] [WS] BeamCore rejected task_result: "
+                                        f"task={task_label(ack_task_id)} offer={task_label(ack_offer_id)} "
+                                        f"status={ack.status or 'unknown'} reason={ack.reason or 'unknown'}"
                                     )
 
                             elif msg_type == "error":
@@ -1490,6 +1308,7 @@ async def websocket_loop(state: WorkerState):
             print(f"[Worker] [WS] Connection error: {type(e).__name__}: {e}")
 
         state.ws_connected = False
+        state.active_websocket = None
         state.ws_reconnect_attempts += 1
 
         if (
@@ -1532,17 +1351,12 @@ async def run_worker(state: WorkerState):
     """Run the worker."""
     wallet = state.wallet
     hotkey = wallet.hotkey.ss58_address
-    if state.ws_send_lock is None:
-        state.ws_send_lock = asyncio.Lock()
 
     # Create HTTP client
     state.http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=5.0),
-        limits=httpx.Limits(
-            max_connections=max(8, MAX_CONCURRENT_TASKS * 4),
-            max_keepalive_connections=max(4, MAX_CONCURRENT_TASKS * 2),
-        ),
     )
+    state.ws_executor_task = asyncio.create_task(ws_task_executor(state))
 
     try:
         async with httpx.AsyncClient() as client:
@@ -1572,9 +1386,13 @@ async def run_worker(state: WorkerState):
         print(f"[Worker] Error: {e}")
         raise
     finally:
-        if state.ws_task_handles:
-            print(f"[Worker] Waiting for {len(state.ws_task_handles)} active WS task(s) to finish")
-            await asyncio.gather(*list(state.ws_task_handles), return_exceptions=True)
+        if state.ws_executor_task is not None:
+            pending_count = state.ws_offer_queue.qsize()
+            if pending_count:
+                print(f"[Worker] Waiting for {pending_count} queued task(s) to finish sequentially")
+            await state.ws_offer_queue.put(None)
+            await state.ws_executor_task
+            state.ws_executor_task = None
         if state.http_client:
             await state.http_client.aclose()
             state.http_client = None
@@ -1594,20 +1412,6 @@ def get_config():
     config = bt.Config(parser)
     return config
 
-def get_wallet():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("--wallet.name", dest="wallet_name")
-    parser.add_argument("--wallet.hotkey", dest="wallet_hotkey")
-
-    args = parser.parse_args()
-
-    wallet = bt.Wallet(
-        name=args.wallet_name,
-        hotkey=args.wallet_hotkey,
-    )
-
-    return wallet
 
 def apply_env_config_overrides(config):
     """Apply deployment env overrides after Bittensor parses its defaults."""
@@ -1641,7 +1445,7 @@ async def main():
     apply_env_config_overrides(config)
 
     # Load bittensor wallet
-    wallet = get_wallet()
+    wallet = bt.Wallet(config=config)
     print(f"Wallet name: {wallet.name}")
     print(f"Hotkey name: {wallet.hotkey_str}")
 
@@ -1655,26 +1459,23 @@ async def main():
 
     # Determine API URL based on network
     network = config.subtensor.get("network", "finney")
-    if network not in ("finney", "mainnet"):
+    if network in ("test", "testnet"):
         api_url = os.environ.get("CORE_SERVER_URL")
         if not api_url:
-            raise RuntimeError("CORE_SERVER_URL is required when running the public worker on a non-mainnet network")
-        print(f"Network: {network}")
+            print("CORE_SERVER_URL is required when running against testnet")
+            sys.exit(1)
+        print("Network: testnet")
     else:
         api_url = os.environ.get("CORE_SERVER_URL", MAINNET_URL)
         print("Network: mainnet")
-    worker_gateway_url = os.environ.get("WORKER_GATEWAY_URL", "https://gw.firefoxnode.com")
+    worker_gateway_url = os.environ.get("WORKER_GATEWAY_URL")
 
     print(f"API URL: {api_url}")
     if worker_gateway_url:
         print(f"Worker gateway URL: {worker_gateway_url}")
     else:
         print("Worker gateway URL: MISSING")
-    print(
-        f"Worker limits: concurrency={MAX_CONCURRENT_TASKS}, "
-        f"ws_queue={MAX_QUEUED_WS_TASKS}, "
-        f"in_flight={MAX_IN_FLIGHT_BYTES // (1024 * 1024)} MiB"
-    )
+    print("Worker execution: sequential FIFO (one task at a time), offer_queue=unbounded")
     print()
 
     # Create worker state

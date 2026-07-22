@@ -75,10 +75,10 @@ This repository is **off-chain node software** (orchestrator, worker, validator)
 
 ```
 Clients / Validators                Orchestrators
-         │ HTTP                           │ WebSocket
+         │ HTTP                           │ NATS (tls://.../4222)
   ┌──────▼────────┐                 ┌─────▼───────┐
-  │  core-server  │  :8000          │orch-gateway │  :8002
-  │ API + Control │◄─WS relay──────►│ Orch WS edge│
+  │  core-server  │  :8000          │orch-gateway │  :4222
+  │ API + Control │◄─NATS control──►│ NATS control│
   └──────┬────────┘                 └─────────────┘
          │ HTTP (internal)
   ┌──────▼────────┐
@@ -93,7 +93,7 @@ Clients / Validators                Orchestrators
 | Piece | Role |
 | ----- | ---- |
 | **core-server** | Public HTTP API, control plane, transfer and task lifecycle (your `CORE_SERVER_URL` / `BEAM_VALIDATOR_*` URLs point here) |
-| **orch-gateway** | Orchestrator WebSocket edge; upstream relay to core-server (`ORCH_GATEWAY_URL`) |
+| **orch-gateway** | Orchestrator **NATS** control session; upstream relay to core-server (`ORCH_GATEWAY_URL` — must be `nats://` or `tls://`, e.g. `tls://orch-gateway.b1m.ai:4222`) |
 | **worker-gateway** | Worker WebSocket edge; task offers and sessions (`WORKER_GATEWAY_URL` — **worker-gateway origin**, not core-server) |
 | **ops-scheduler** | PRISM refresh, payment verification, cleanup jobs |
 
@@ -106,7 +106,7 @@ Clients / Validators                Orchestrators
 ### How this repo fits in
 
 1. **Clients** create transfers via BeamCore HTTP API or SDK (core-server).
-2. **Orchestrators** register over HTTP and keep a **persistent orch-gateway WebSocket** for assignments and control messages — not HTTP polling.
+2. **Orchestrators** register over HTTP and keep a **persistent orch-gateway NATS session** for assignments and control messages — not HTTP polling.
 3. **Workers** register over HTTP, then receive chunk **offers** over **worker-gateway** WebSockets (Beam-hosted gateway and/or an orchestrator-owned gateway, depending on configuration).
 4. **Workers** move data directly between source and destination connectors; they submit **payment / PoB evidence** to BeamCore HTTP.
 5. **Validators** read scores and PRISM inputs from BeamCore HTTP and set weights on Bittensor.

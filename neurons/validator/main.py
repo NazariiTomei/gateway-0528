@@ -2,6 +2,14 @@
 BEAM Validator Node Entry Point
 
 Run with: python main.py
+
+Mainnet settings:
+- BEAM_VALIDATOR_CORE_SERVER_URL=https://beamcore.b1m.ai
+- SUBTENSOR_NETWORK=finney
+- NETUID=105
+
+The validator fetches BeamCore epoch summaries, sets the returned weights on
+Bittensor, and posts a weight proof back to BeamCore.
 """
 
 import asyncio
@@ -15,6 +23,35 @@ from datetime import datetime
 import uvicorn
 from fastapi import FastAPI, HTTPException
 
+
+def _fetch_uid_config_sync():
+    """
+    Fetch UID ranges from BeamCore synchronously before beam-dependent imports.
+    """
+    import httpx
+
+    core_url = os.getenv("BEAM_VALIDATOR_CORE_SERVER_URL", "https://beamcore.b1m.ai")
+
+    try:
+        response = httpx.get(f"{core_url}/config/uid-ranges", timeout=5.0)
+        response.raise_for_status()
+        data = response.json()
+
+        os.environ["PUBLIC_ORCHESTRATOR_UID_START"] = str(data["public_orchestrator_uid_start"])
+        os.environ["PUBLIC_ORCHESTRATOR_UID_END"] = str(data["public_orchestrator_uid_end"])
+        os.environ["MAX_ORCHESTRATORS"] = str(data["max_orchestrators"])
+
+        print(
+            f"[Startup] Fetched UID config from {core_url}: "
+            f"public={data['public_orchestrator_uid_start']}-{data['public_orchestrator_uid_end']}, "
+            f"max_orchestrators={data['max_orchestrators']}"
+        )
+    except Exception as exc:
+        print(f"[Startup] Warning: Could not fetch UID config from {core_url}: {exc}")
+        print("[Startup] Using default UID ranges from environment or beam defaults")
+
+
+_fetch_uid_config_sync()
 
 from clients import close_subnet_core_client, init_subnet_core_client
 from core.config import get_settings
@@ -58,7 +95,6 @@ async def lifespan(app: FastAPI):
             base_url=settings.core_server_url,
             validator_hotkey=validator.hotkey,
             wallet=validator.wallet,
-            api_key=settings.subnet_core_api_key,
         )
         validator.subnet_core_client = subnet_core_client
         signed_auth = "enabled" if validator.wallet else "disabled"
@@ -164,30 +200,24 @@ async def get_network_analytics():
     total_bandwidth = 0.0
     healthy_count = 0
 
-    if hasattr(validator, "orchestrator_manager"):
-        for orch in validator.orchestrator_manager.get_all_orchestrators():
-            score = float(getattr(orch, "last_score", 0.0) or 0.0)
-            is_healthy = score > 0.05
-            bandwidth = float(getattr(orch, "bandwidth_mbps", 0.0) or 0.0)
-
-            if is_healthy:
-                healthy_count += 1
-
-            total_bandwidth += bandwidth
-
-            orchestrators.append(
-                {
-                    "uid": orch.uid,
-                    "hotkey": (
-                        orch.hotkey[:8] + "..." + orch.hotkey[-4:] if orch.hotkey else "unknown"
-                    ),
-                    "is_healthy": is_healthy,
-                    "score": round(score, 4),
-                    "bandwidth_mbps": round(bandwidth, 2),
-                    "worker_count": getattr(orch, "worker_count", 0),
-                    "is_subnet_owned": getattr(orch, "is_subnet_owned", False),
-                }
-            )
+    for orch in validator.orchestrators.values():
+        score = float(orch.last_score or 0.0)
+        is_healthy = orch.is_healthy
+        if is_healthy:
+            healthy_count += 1
+        orchestrators.append(
+            {
+                "uid": orch.uid,
+                "hotkey": (
+                    orch.hotkey[:8] + "..." + orch.hotkey[-4:] if orch.hotkey else "unknown"
+                ),
+                "is_healthy": is_healthy,
+                "score": round(score, 4),
+                "bandwidth_mbps": 0.0,
+                "worker_count": validator._beamcore_worker_counts.get(orch.uid, 0),
+                "is_subnet_owned": orch.is_subnet_owned,
+            }
+        )
 
     sybil_stats = {"tracked_entities": 0, "suspicious_count": 0}
     if hasattr(validator, "sybil_detector"):
@@ -234,22 +264,16 @@ async def get_orchestrator_analytics():
         raise HTTPException(status_code=503, detail="Validator not initialized")
 
     orchestrators = []
-    if hasattr(validator, "orchestrator_manager"):
-        for orch in validator.orchestrator_manager.get_all_orchestrators():
-            orch_data = {
-                "uid": orch.uid,
-                "hotkey": orch.hotkey,
-                "is_subnet_owned": getattr(orch, "is_subnet_owned", False),
-                "worker_count": getattr(orch, "worker_count", 0),
-            }
-
-            orch_data["score"] = round(float(getattr(orch, "last_score", 0.0) or 0.0), 4)
-
-            if hasattr(validator, "_get_sybil_penalty_multipliers"):
-                sybil_mults = validator._get_sybil_penalty_multipliers()
-                orch_data["sybil_multiplier"] = round(sybil_mults.get(orch.hotkey, 1.0), 4)
-
-            orchestrators.append(orch_data)
+    sybil_mults = validator._get_sybil_penalty_multipliers() if hasattr(validator, "_get_sybil_penalty_multipliers") else {}
+    for orch in validator.orchestrators.values():
+        orchestrators.append({
+            "uid": orch.uid,
+            "hotkey": orch.hotkey,
+            "is_subnet_owned": orch.is_subnet_owned,
+            "worker_count": validator._beamcore_worker_counts.get(orch.uid, 0),
+            "score": round(float(orch.last_score or 0.0), 4),
+            "sybil_multiplier": round(sybil_mults.get(orch.hotkey, 1.0), 4),
+        })
 
     return {
         "count": len(orchestrators),
@@ -268,26 +292,22 @@ async def get_leaderboard():
         raise HTTPException(status_code=503, detail="Validator not initialized")
 
     leaderboard = []
-    if hasattr(validator, "orchestrator_manager"):
-        for orch in validator.orchestrator_manager.get_all_orchestrators():
-            if orch.is_subnet_owned:
-                continue
-
-            score = float(getattr(orch, "last_score", 0.0) or 0.0)
-            bandwidth = float(getattr(orch, "bandwidth_mbps", 0.0) or 0.0)
-
-            leaderboard.append(
-                {
-                    "rank": 0,
-                    "uid": orch.uid,
-                    "hotkey_short": (
-                        orch.hotkey[:8] + "..." + orch.hotkey[-4:] if orch.hotkey else "unknown"
-                    ),
-                    "score": round(score * 100, 2),
-                    "bandwidth_mbps": round(bandwidth, 2),
-                    "worker_count": getattr(orch, "worker_count", 0),
-                }
-            )
+    for orch in validator.orchestrators.values():
+        if orch.is_subnet_owned:
+            continue
+        score = float(orch.last_score or 0.0)
+        leaderboard.append(
+            {
+                "rank": 0,
+                "uid": orch.uid,
+                "hotkey_short": (
+                    orch.hotkey[:8] + "..." + orch.hotkey[-4:] if orch.hotkey else "unknown"
+                ),
+                "score": round(score * 100, 2),
+                "bandwidth_mbps": 0.0,
+                "worker_count": validator._beamcore_worker_counts.get(orch.uid, 0),
+            }
+        )
 
     leaderboard.sort(key=lambda item: item["score"], reverse=True)
     for index, entry in enumerate(leaderboard):
@@ -357,7 +377,9 @@ def main():
         import time
         import webbrowser
 
-        log_viewer_url = os.environ.get("LOG_VIEWER_URL", "https://beamcore.b1m.ai/logs/")
+        log_viewer_url = os.environ.get("LOG_VIEWER_URL")
+        if not log_viewer_url:
+            raise RuntimeError("LOG_VIEWER_URL is required when OPEN_LOG_VIEWER is enabled")
 
         def open_logs():
             time.sleep(1.5)

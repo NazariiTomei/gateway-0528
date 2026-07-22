@@ -35,6 +35,14 @@ class DedicatedWorkerGateway:
         if hasattr(self._client, "set_upstream"):
             self._client.set_upstream(upstream)
 
+    @property
+    def connected_count(self) -> int:
+        return len(self.workers_snapshot())
+
+    async def stop(self) -> None:
+        if hasattr(self._client, "stop"):
+            await self._client.stop()
+
     def reset_batch_load(self) -> None:
         self._batch_load.clear()
 

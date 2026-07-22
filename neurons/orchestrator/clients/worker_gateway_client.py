@@ -15,6 +15,17 @@ from websockets.exceptions import ConnectionClosed
 
 logger = logging.getLogger(__name__)
 
+_RESULT_FORWARD_RETRY_BASE_SECONDS = 0.25
+_RESULT_FORWARD_RETRY_MAX_SECONDS = 2.0
+_RESULT_TERMINAL_STATUSES = {
+    "owned_processing",
+    "completed",
+    "failed",
+    "late_superseded",
+    "late_expired",
+    "rejected",
+}
+
 
 def _http_to_ws_url(base_url: str, path: str = "") -> str:
     base = base_url.rstrip("/")
@@ -56,6 +67,7 @@ class WorkerGatewayClient:
 
         self._pending: Dict[str, asyncio.Future] = {}
         self._local_workers: Dict[str, dict] = {}
+        self._result_forward_tasks: Dict[str, asyncio.Task] = {}
 
         self._on_worker_stats_update: Optional[Callable[[dict], Any]] = None
         self._upstream: Optional[Any] = None
@@ -96,6 +108,13 @@ class WorkerGatewayClient:
             await self._ws.close()
         self._ws = None
         self._connected = False
+
+        if self._result_forward_tasks:
+            pending = list(self._result_forward_tasks.values())
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            self._result_forward_tasks.clear()
 
     async def _connection_loop(self) -> None:
         while self._running:
@@ -198,10 +217,6 @@ class WorkerGatewayClient:
                 if data.get("capacity") is not None:
                     rec["capacity"] = int(data["capacity"])
 
-        elif msg_type == "task_accept":
-            asyncio.create_task(self._relay_task_decision(data))
-        elif msg_type == "task_reject":
-            asyncio.create_task(self._relay_task_decision(data))
         elif msg_type == "task_result":
             asyncio.create_task(self._relay_task_result(data))
 
@@ -210,78 +225,19 @@ class WorkerGatewayClient:
             return
         await self._ws.send(json.dumps(payload))
 
-    async def _relay_task_decision(self, data: dict) -> None:
-        worker_id = data.get("worker_id")
-        msg_type = data.get("type")
-        if not worker_id or msg_type not in ("task_accept", "task_reject"):
-            return
-        ack_type = "task_accept_ack" if msg_type == "task_accept" else "task_reject_ack"
-        task_id = data.get("task_id") or data.get("offer_id")
-        offer_id = data.get("offer_id") or task_id
-        if not self._upstream:
-            await self._send_worker_payload(
-                {
-                    "type": ack_type,
-                    "worker_id": worker_id,
-                    "task_id": task_id,
-                    "offer_id": offer_id,
-                    "accepted": False,
-                    "reason": "beamcore_unavailable",
-                }
-            )
-            return
-        try:
-            if msg_type == "task_accept":
-                ack = await self._upstream.send_task_accept(
-                    task_id=task_id,
-                    worker_id=worker_id,
-                    offer_id=offer_id,
-                    worker_version=data.get("worker_version"),
-                )
-            else:
-                ack = await self._upstream.send_task_reject(
-                    task_id=task_id,
-                    worker_id=worker_id,
-                    offer_id=offer_id,
-                    reason=data.get("reason"),
-                )
-        except Exception as exc:
-            logger.warning("relay %s failed: %s", msg_type, exc)
-            ack = {
-                "type": ack_type,
-                "task_id": task_id,
-                "offer_id": offer_id,
-                "accepted": False,
-                "reason": "beamcore_decision_forward_failed",
-            }
-        await self._send_worker_payload(
-            {
-                **(ack if isinstance(ack, dict) else {}),
-                "type": ack_type,
-                "worker_id": worker_id,
-                "task_id": task_id,
-                "offer_id": offer_id,
-            }
-        )
-
     async def _relay_task_result(self, data: dict) -> None:
+        """Forward a worker's task_result upstream, retrying until BeamCore
+        reaches a terminal status, then relay the ack back to the worker.
+
+        Mirrors neurons/orchestrator/core/worker_gateway.py's
+        _forward_task_result_to_beamcore for the in-process gateway path —
+        BeamCore acks are not always terminal on the first attempt, so a
+        single-shot relay (the old behavior here) can silently drop results.
+        """
         worker_id = data.get("worker_id")
         task_id = data.get("task_id")
         offer_id = data.get("offer_id") or task_id
         if not worker_id:
-            return
-        if not self._upstream:
-            await self._send_worker_payload(
-                {
-                    "type": "task_result_ack",
-                    "worker_id": worker_id,
-                    "task_id": task_id,
-                    "offer_id": offer_id,
-                    "received": False,
-                    "completed": False,
-                    "reason": "beamcore_unavailable",
-                }
-            )
             return
         if not task_id or not offer_id:
             await self._send_worker_payload(
@@ -291,11 +247,16 @@ class WorkerGatewayClient:
                     "task_id": task_id,
                     "offer_id": offer_id,
                     "received": False,
-                    "completed": False,
+                    "status": "rejected",
                     "reason": "missing_task_or_offer_id",
                 }
             )
             return
+
+        result_key = f"{offer_id}:{worker_id}"
+        if result_key in self._result_forward_tasks:
+            return
+
         payload = {
             "type": "task_result",
             "task_id": task_id,
@@ -306,27 +267,73 @@ class WorkerGatewayClient:
         for key in ("etag", "chunk_hash", "error"):
             if data.get(key) is not None:
                 payload[key] = data[key]
-        try:
-            ack = await self._upstream.send_task_result(payload)
-        except Exception as exc:
-            logger.warning("relay task_result failed: %s", exc)
-            ack = {
-                "type": "task_result_ack",
-                "task_id": task_id,
-                "offer_id": offer_id,
-                "received": False,
-                "completed": False,
-                "reason": "beamcore_result_forward_failed",
-            }
-        await self._send_worker_payload(
-            {
-                **(ack if isinstance(ack, dict) else {}),
-                "type": "task_result_ack",
-                "worker_id": worker_id,
-                "task_id": task_id,
-                "offer_id": offer_id,
-            }
-        )
+
+        task = asyncio.create_task(self._forward_task_result_to_upstream(worker_id, payload))
+        self._result_forward_tasks[result_key] = task
+
+        def _done(done_task: asyncio.Task) -> None:
+            if self._result_forward_tasks.get(result_key) is done_task:
+                self._result_forward_tasks.pop(result_key, None)
+            try:
+                exc = done_task.exception()
+            except asyncio.CancelledError:
+                return
+            if exc is not None:
+                logger.error("task_result forward crashed: %s", exc)
+
+        task.add_done_callback(_done)
+
+    async def _forward_task_result_to_upstream(self, worker_id: str, payload: dict) -> None:
+        task_id = payload.get("task_id")
+        offer_id = payload.get("offer_id") or task_id
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                if self._upstream is None:
+                    raise RuntimeError("beamcore_unavailable")
+                sender = getattr(self._upstream, "send_task_result_strict", None) or self._upstream.send_task_result
+                ack = await sender(payload)
+                if not isinstance(ack, dict):
+                    raise RuntimeError("invalid_beamcore_ack")
+                status = str(ack.get("status") or "")
+                if status in _RESULT_TERMINAL_STATUSES:
+                    await self._send_worker_payload(
+                        {
+                            **ack,
+                            "type": "task_result_ack",
+                            "worker_id": worker_id,
+                            "task_id": task_id,
+                            "offer_id": offer_id,
+                        }
+                    )
+                    logger.info(
+                        "task_result relay terminal: task=%s offer=%s worker=%s status=%s",
+                        task_id,
+                        offer_id,
+                        worker_id,
+                        status,
+                    )
+                    return
+                retry_reason = ack.get("reason") or status or "invalid_ack_status"
+            except Exception as exc:
+                retry_reason = type(exc).__name__
+
+            delay = min(
+                _RESULT_FORWARD_RETRY_MAX_SECONDS,
+                _RESULT_FORWARD_RETRY_BASE_SECONDS * (2 ** min(attempt - 1, 16)),
+            )
+            if attempt == 1 or attempt & (attempt - 1) == 0:
+                logger.info(
+                    "task_result relay retry: task=%s offer=%s worker=%s attempt=%s delay_s=%.3f reason=%s",
+                    task_id,
+                    offer_id,
+                    worker_id,
+                    attempt,
+                    delay,
+                    retry_reason,
+                )
+            await asyncio.sleep(delay)
 
     async def _send(self, message: dict, timeout: float = 15.0) -> dict:
         if not self._ws or not self._connected:
@@ -404,51 +411,3 @@ class WorkerGatewayClient:
             )
         return success
 
-    async def send_task_accept_ack(
-        self,
-        worker_id: str,
-        task_id: str,
-        offer_id: str,
-        accepted: bool,
-        reason: str = "",
-    ) -> None:
-        if not self._ws or not self._connected:
-            return
-        payload = {
-            "type": "task_accept_ack",
-            "worker_id": worker_id,
-            "task_id": task_id,
-            "offer_id": offer_id,
-            "accepted": accepted,
-        }
-        if reason:
-            payload["reason"] = reason
-        logger.info(
-            "orch->gateway task_accept_ack: worker=%s task=%s accepted=%s",
-            worker_id,
-            (task_id or "")[:16],
-            accepted,
-        )
-        await self._ws.send(json.dumps(payload))
-
-    async def send_task_result_ack(
-        self,
-        worker_id: str,
-        task_id: str,
-        offer_id: str,
-        received: bool,
-        reason: str = "",
-    ) -> None:
-        if not self._ws or not self._connected:
-            return
-        payload = {
-            "type": "task_result_ack",
-            "worker_id": worker_id,
-            "task_id": task_id,
-            "offer_id": offer_id,
-            "received": received,
-            "completed": received,
-        }
-        if reason:
-            payload["reason"] = reason
-        await self._ws.send(json.dumps(payload))

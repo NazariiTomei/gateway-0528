@@ -1,73 +1,129 @@
 # Beam Validator
 
-Validators read scoring inputs from the public BEAM control plane and set weights on Bittensor subnet 105.
+The validator reads BeamCore's materialized epoch summary, sets the returned weights on Bittensor subnet 105, and posts the weight proof back to BeamCore.
 
 ## Install
 
-From the repository root:
-
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+# From the repository root
 pip install -e ".[validator]"
 ```
 
-## Configure
-
-```bash
-BEAM_VALIDATOR_CORE_SERVER_URL=http://161.35.129.73:8000
-SUBTENSOR_NETWORK=finney
-NETUID=105
-BEAM_VALIDATOR_WALLET_NAME=your_coldkey
-BEAM_VALIDATOR_WALLET_HOTKEY=your_hotkey
-```
-
-## Run
+## Mainnet Quick Start
 
 ```bash
 cd neurons/validator
+
+BEAM_VALIDATOR_WALLET_NAME=your_coldkey \
+BEAM_VALIDATOR_WALLET_HOTKEY=your_hotkey \
+BEAM_VALIDATOR_CORE_SERVER_URL=https://beamcore.b1m.ai \
+SUBTENSOR_NETWORK=finney \
+NETUID=105 \
 python main.py
 ```
 
-## Environment
+## Configuration
 
-Settings use the `BEAM_VALIDATOR_*` prefix (see [`core/config.py`](core/config.py)). Chain selection uses the unprefixed `SUBTENSOR_NETWORK` and `NETUID` settings.
+Settings use the `BEAM_VALIDATOR_*` prefix except for shared subnet settings `SUBTENSOR_NETWORK` and `NETUID`.
 
-### Required
+### Required for production
 
-| Variable                         | Description                              | Default                     |
-| -------------------------------- | ---------------------------------------- | --------------------------- |
-| `BEAM_VALIDATOR_WALLET_NAME`     | Bittensor coldkey name                   | `default`                   |
-| `BEAM_VALIDATOR_WALLET_HOTKEY`   | Bittensor hotkey name                    | `default`                   |
-| `BEAM_VALIDATOR_CORE_SERVER_URL` | BeamCore HTTP base URL                   | `http://161.35.129.73:8000` |
-| `SUBTENSOR_NETWORK`              | Bittensor network (`finney` for mainnet) | `finney`                    |
-| `NETUID`                         | BEAM subnet UID                          | `105`                       |
+| Variable | Description | Production value |
+|---|---|---|
+| `BEAM_VALIDATOR_WALLET_NAME` | Bittensor wallet name | your wallet name |
+| `BEAM_VALIDATOR_WALLET_HOTKEY` | Hotkey name within the wallet | your validator hotkey |
+| `BEAM_VALIDATOR_CORE_SERVER_URL` | BeamCore HTTP base URL | `https://beamcore.b1m.ai` |
+| `SUBTENSOR_NETWORK` | Bittensor network | `finney` |
+| `NETUID` | Beam subnet UID | `105` |
 
-### Optional
+### Common optional settings
 
-| Variable                                    | Description                                                              | Default                |
-| ------------------------------------------- | ------------------------------------------------------------------------ | ---------------------- |
-| `BEAM_VALIDATOR_WALLET_PATH`                | Wallet directory                                                         | `~/.bittensor/wallets` |
-| `BEAM_VALIDATOR_PORT`                       | HTTP port for the validator API                                          | `8093`                 |
-| `BEAM_VALIDATOR_LOG_LEVEL`                  | Logging verbosity (`DEBUG`, `INFO`, `WARNING`)                           | `INFO`                 |
-| `LOCAL_MODE`                                | Disable chain calls for local dev (no prefix)                            | `false`                |
-| `BEAM_VALIDATOR_DISABLE_WEIGHT_SET`         | Skip on-chain `set_weights` (live-test guard)                            | `false`                |
-| `BEAM_VALIDATOR_HEARTBEAT_INTERVAL_SECONDS` | BeamCore heartbeat cadence                                               | `60`                   |
-| `BEAM_VALIDATOR_BLOCKS_BETWEEN_WEIGHTS`     | Minimum blocks between weight sets                                       | `100`                  |
-| `BEAM_VALIDATOR_EXTERNAL_URL`               | Public URL advertised to BeamCore (e.g. `https://validator.example.com`) | —                      |
+| Variable | Description | Default |
+|---|---|---|
+| `BEAM_VALIDATOR_WALLET_PATH` | Wallet directory | `~/.bittensor/wallets` |
+| `BEAM_VALIDATOR_PORT` | Local validator API port | `8093` |
+| `BEAM_VALIDATOR_LOG_LEVEL` | Logging verbosity | `INFO` |
+| `BEAM_VALIDATOR_EXTERNAL_URL` | Public URL advertised in heartbeat | unset |
+| `BEAM_VALIDATOR_BLOCKS_BETWEEN_WEIGHTS` | Minimum blocks between weight sets | `100` |
+| `BEAM_VALIDATOR_DISABLE_WEIGHT_SET` | Skip on-chain `set_weights` | `false` |
+| `LOCAL_MODE` | Local harness mode, unprefixed | `false` |
 
-### Minimum production `.env`
+### Minimum `.env`
 
 ```dotenv
 BEAM_VALIDATOR_WALLET_NAME=your_coldkey
 BEAM_VALIDATOR_WALLET_HOTKEY=your_hotkey
-NETUID=105
+BEAM_VALIDATOR_CORE_SERVER_URL=https://beamcore.b1m.ai
 SUBTENSOR_NETWORK=finney
-BEAM_VALIDATOR_CORE_SERVER_URL=http://161.35.129.73:8000
-## BEAM_VALIDATOR_CORE_SERVER_URL=https://beamcore.b1m.ai
+NETUID=105
 LOCAL_MODE=false
 ```
 
-Validator routes are rooted at `BEAM_VALIDATOR_CORE_SERVER_URL` with no `/api` prefix.
+## Runtime Flow
 
-See [../../docs/validator.md](../../docs/validator.md) for the full operator guide.
+The current runtime path is implemented in `core/validator.py` and `clients/subnet_core_client.py`:
+
+1. `main.py` fetches `GET /config/uid-ranges` from BeamCore before imports finish.
+2. The validator initializes wallet, subtensor, metagraph, and the BeamCore client.
+3. `_get_persisted_weight_snapshot()` calls `GET /Validator/epoch-summary/latest-epoch`.
+4. `_set_weights()` submits the returned `uids` and `weights` to Bittensor.
+5. On success, `submit_weight_proof()` posts to `POST /validators/weights/proof`.
+6. Heartbeats are sent to `POST /validators/heartbeat`.
+
+The production validator does not compute PRISM weights locally and does not call older scoring, orchestrator-list, spot-check, or generic weight-submission routes.
+
+## BeamCore API Surface Used By The Client
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/config/uid-ranges` | GET | Startup UID range bootstrap |
+| `/config/network` | GET | Optional network config helper |
+| `/Validator/epoch-summary/latest-epoch` | GET | Materialized UID/weight vector |
+| `/validators/weights/proof` | POST | Record successful on-chain weight set |
+| `/validators/heartbeat` | POST | Report validator liveness |
+
+## Local Operator API
+
+The validator serves FastAPI on `0.0.0.0:${BEAM_VALIDATOR_PORT:-8093}`.
+
+| Endpoint | Description |
+|---|---|
+| `GET /health` | Basic validator health |
+| `GET /health/detailed` | Detailed component checks when available |
+| `GET /state` | Runtime state |
+| `GET /scores` | Local connection scores |
+| `GET /weights` | Recent weight-set history |
+
+Logs are written to `${LOG_DIR}/validator.log`; `LOG_DIR` defaults to `/tmp/beam_validator_logs`.
+
+## Health Check
+
+```bash
+curl http://localhost:8093/health
+```
+
+Minimal response:
+
+```json
+{
+  "status": "healthy",
+  "node_type": "validator",
+  "external_url": null
+}
+```
+
+## Weight Snapshot Behavior
+
+The validator expects BeamCore to return matching `uids` and `weights` arrays:
+
+```json
+{
+  "epoch": 17925,
+  "uids": [12, 47, 52],
+  "weights": [0.42, 0.33, 0.25],
+  "formula_version": "prism_final_x_task_done_count",
+  "params_hash": "..."
+}
+```
+
+If the summary is unavailable or malformed, the validator skips the weight window. It does not invent fallback weights for production.

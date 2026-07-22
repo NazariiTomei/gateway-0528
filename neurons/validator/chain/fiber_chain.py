@@ -80,13 +80,13 @@ class FiberChain:
         self,
         subtensor_network: str = "finney",
         subtensor_address: Optional[str] = None,
-        netuid: int = 1,
+        netuid: int = 105,
     ):
         """
         Initialize Bittensor chain interface.
 
         Args:
-            subtensor_network: Network name (finney, test, local)
+            subtensor_network: Bittensor network name
             subtensor_address: Direct websocket address (optional)
             netuid: Subnet ID
         """
