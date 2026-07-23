@@ -168,6 +168,7 @@ class WorkerGatewayClient:
                 wid = worker.get("worker_id")
                 if wid:
                     self._local_workers[wid] = worker
+                    await self._dispatch_worker_stats(worker)
             logger.info(
                 "Worker gateway control ready (%s workers connected)",
                 len(self._local_workers),

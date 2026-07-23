@@ -132,6 +132,7 @@ FETCH_STREAM_CHUNK_SIZE = 64 * 1024
 WS_TASK_RESULT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_RESULT_ACK_TIMEOUT", "3.0"))
 WS_TASK_RESULT_SEND_ATTEMPTS = max(3, int(os.environ.get("WORKER_TASK_RESULT_SEND_ATTEMPTS", "8")))
 WS_TASK_RESULT_RECONNECT_WAIT_SECONDS = max(0.0, float(os.environ.get("WORKER_TASK_RESULT_RECONNECT_WAIT_SECONDS", "2.0")))
+WORKER_MAX_CONCURRENT_TASKS = max(1, int(os.environ.get("WORKER_MAX_CONCURRENT_TASKS", "4")))
 TASK_RESULT_ACK_STATUSES = {
     "owned_processing",
     "completed",
@@ -163,7 +164,7 @@ class WorkerState:
     pending_task_results: Dict[str, asyncio.Future] = field(default_factory=dict)
     active_ws_task_ids: set[str] = field(default_factory=set)
     ws_offer_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
-    ws_executor_task: Optional[asyncio.Task] = None
+    ws_executor_tasks: list[asyncio.Task] = field(default_factory=list)
     active_websocket: Optional[Any] = None
 
 
@@ -1108,7 +1109,7 @@ def enqueue_ws_task(state: WorkerState, websocket, task: dict) -> None:
 
 
 async def ws_task_executor(state: WorkerState) -> None:
-    """Execute queued offers one at a time, in arrival order."""
+    """Execute queued offers, sharing the queue with sibling executors up to WORKER_MAX_CONCURRENT_TASKS."""
     while True:
         item = await state.ws_offer_queue.get()
         try:
@@ -1356,7 +1357,9 @@ async def run_worker(state: WorkerState):
     state.http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=5.0),
     )
-    state.ws_executor_task = asyncio.create_task(ws_task_executor(state))
+    state.ws_executor_tasks = [
+        asyncio.create_task(ws_task_executor(state)) for _ in range(WORKER_MAX_CONCURRENT_TASKS)
+    ]
 
     try:
         async with httpx.AsyncClient() as client:
@@ -1386,13 +1389,14 @@ async def run_worker(state: WorkerState):
         print(f"[Worker] Error: {e}")
         raise
     finally:
-        if state.ws_executor_task is not None:
+        if state.ws_executor_tasks:
             pending_count = state.ws_offer_queue.qsize()
             if pending_count:
-                print(f"[Worker] Waiting for {pending_count} queued task(s) to finish sequentially")
-            await state.ws_offer_queue.put(None)
-            await state.ws_executor_task
-            state.ws_executor_task = None
+                print(f"[Worker] Waiting for {pending_count} queued task(s) to finish")
+            for _ in state.ws_executor_tasks:
+                await state.ws_offer_queue.put(None)
+            await asyncio.gather(*state.ws_executor_tasks)
+            state.ws_executor_tasks = []
         if state.http_client:
             await state.http_client.aclose()
             state.http_client = None
@@ -1475,7 +1479,7 @@ async def main():
         print(f"Worker gateway URL: {worker_gateway_url}")
     else:
         print("Worker gateway URL: MISSING")
-    print("Worker execution: sequential FIFO (one task at a time), offer_queue=unbounded")
+    print(f"Worker execution: {WORKER_MAX_CONCURRENT_TASKS} concurrent executors, offer_queue=unbounded")
     print()
 
     # Create worker state
