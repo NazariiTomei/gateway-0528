@@ -1010,6 +1010,8 @@ async def ws_send_task_result(
         }
         if duration_ms is not None:
             msg["duration_ms"] = duration_ms
+        if success and bytes_transferred > 0 and duration_ms:
+            msg["bandwidth_mbps"] = round((bytes_transferred * 8 / 1_000_000) / (duration_ms / 1000), 2)
         if chunk_hash:
             msg["chunk_hash"] = chunk_hash
         if etag:

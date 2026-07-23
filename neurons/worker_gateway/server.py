@@ -313,8 +313,8 @@ def create_app(
                     rec = gateway_state.metrics.on_task_result(
                         worker_id,
                         success=success,
-                        bytes_transferred=0,
-                        bandwidth_mbps=None,
+                        bytes_transferred=int(data.get("bytes_transferred") or 0),
+                        bandwidth_mbps=data.get("bandwidth_mbps"),
                     )
                     session.bandwidth_mbps = rec.bandwidth_mbps
                     session.active_tasks = rec.active_tasks
