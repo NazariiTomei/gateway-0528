@@ -648,6 +648,7 @@ async def send_chunk(
     offer_id: str = None,
     route_metadata: Optional[Dict[str, Any]] = None,
     offer_dest_headers: dict = None,
+    precomputed_sha256: Optional[str] = None,
 ) -> tuple:
     """Send chunk data to destination URL.
 
@@ -664,7 +665,7 @@ async def send_chunk(
     if is_object_storage:
         headers = {"Content-Type": "application/octet-stream"}
     else:
-        chunk_sha256 = hashlib.sha256(data).hexdigest()
+        chunk_sha256 = precomputed_sha256 or hashlib.sha256(data).hexdigest()
         headers = {
             "Content-Type": "application/octet-stream",
             "X-Transfer-ID": transfer_id,
@@ -810,7 +811,8 @@ async def execute_transfer(
             )
 
         hash_started = time.perf_counter()
-        computed_chunk_hash = hashlib.sha256(data).hexdigest()
+        hasher = await asyncio.to_thread(hashlib.sha256, data)
+        computed_chunk_hash = hasher.hexdigest()
         hash_ms = (time.perf_counter() - hash_started) * 1000
 
         expected_chunk_hash = chunk_hashes.get(chunk_index) or ""
@@ -843,6 +845,7 @@ async def execute_transfer(
                 task_id=task_id,
                 offer_id=offer_id,
                 offer_dest_headers=dest_headers_offer or None,
+                precomputed_sha256=computed_chunk_hash,
             )
             send_ms = (time.perf_counter() - send_started) * 1000
             if etag:
